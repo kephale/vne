@@ -1,5 +1,6 @@
 import os
 import string
+import requests
 from typing import Optional, Tuple
 
 import numpy as np
@@ -15,35 +16,34 @@ DEFAULT_FONT = None  # ImageFont.load_default()
 
 def _download_default_font():
     """Download a default font and return the filename."""
+    font_url = "https://github.com/edx/edx-fonts/raw/refs/heads/master/open-sans/fonts/Regular/OpenSans-Regular.ttf"
+    font_path = os.path.join(os.path.dirname(__file__), "special", "font", "OpenSans-Regular.ttf")
 
-    import io
-    import zipfile
+    # Ensure the directory exists
+    os.makedirs(os.path.dirname(font_path), exist_ok=True)
+    print(font_path)
 
-    import requests
+    # Download the font if it does not exist
+    if not os.path.exists(font_path):
+        response = requests.get(font_url)
+        response.raise_for_status()  # Raise an error if the download failed
+        with open(font_path, "wb") as f:
+            f.write(response.content)
+        print(f"Font downloaded to: {font_path}")
 
-    font_url = "https://fonts.google.com/download?family=Open%20Sans"
-    r = requests.get(font_url)
-
-    zip_path = os.path.join(os.path.dirname(__file__), "special", "font")
-
-    font_file = os.path.join(
-        zip_path, "static", "OpenSans", "OpenSans-Regular.ttf"
-    )
-
-    if os.path.exists(font_file):
-        return font_file
-
-    buffer = io.BytesIO(r.content)
-
-    with zipfile.ZipFile(buffer, "r") as zip_ref:
-        zip_ref.extractall(zip_path)
-
-    assert os.path.exists(font_file)
-    return font_file
+    # Verify the file format by trying to load it
+    try:
+        font = ImageFont.truetype(font_path)
+        print(f"Font successfully loaded: {font_path}")
+    except OSError:
+        raise OSError(f"Failed to load font from {font_path}. The file format might be invalid.")
+    
+    return font_path
 
 
 def set_default_font(filename: Optional[os.PathLike] = None, size: int = 36):
     """Set the default font from a file."""
+    print(filename)
     if not filename:
         filename = _download_default_font()
 
