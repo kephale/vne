@@ -1,1 +1,1 @@
-from vne.utils.napari import GenerativeAffinityVAEWidget  # NOQA: F401
+# from vne.utils.napari import GenerativeAffinityVAEWidget  # NOQA: F401

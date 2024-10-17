@@ -1,0 +1,22 @@
+name: vne
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - ase
+  - numpy<2
+  - pillow
+  - requests
+  - scikit-image
+  - scikit-learn
+  - scipy
+  - pytorch
+  - torchvision
+  - ipykernel
+  - pip
+  - pip:
+      - pathos
+      - copick
+      - gemmi
+      - dscribe

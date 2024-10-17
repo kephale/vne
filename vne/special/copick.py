@@ -4,26 +4,56 @@ from torch.utils.data import Dataset
 from typing import List, Tuple, Optional
 import copick
 from pathlib import Path
+import os
+import pickle
 
 class CopickDataset(Dataset):
     def __init__(
         self,
         config_path: str,
         boxsize: Tuple[int, int, int] = (32, 32, 32),
-        augment: bool = False
+        augment: bool = False,
+        cache_dir: str = "./dataset_cache"
     ):
         self.root = copick.from_file(config_path)
         self.boxsize = boxsize
         self.augment = augment
+        self.cache_dir = cache_dir
         
         self._subvolumes = []
         self._molecule_ids = []
         self._keys = []
         
-        self._load_data()
+        self._load_or_process_data()
 
         if len(self._subvolumes) == 0:
             raise ValueError("No valid subvolumes found in the dataset. Please check your Copick configuration and ensure there are valid picks and tomograms.")
+
+    def _load_or_process_data(self):
+        cache_file = os.path.join(self.cache_dir, f"copick_cache_{self.boxsize[0]}x{self.boxsize[1]}x{self.boxsize[2]}.pkl")
+        
+        if os.path.exists(cache_file):
+            print(f"Loading cached data from {cache_file}")
+            with open(cache_file, 'rb') as f:
+                cached_data = pickle.load(f)
+                self._subvolumes = cached_data['subvolumes']
+                self._molecule_ids = cached_data['molecule_ids']
+                self._keys = cached_data['keys']
+        else:
+            print("Processing data and creating cache...")
+            self._load_data()
+            
+            # Create cache directory if it doesn't exist
+            os.makedirs(self.cache_dir, exist_ok=True)
+            
+            # Save processed data to cache
+            with open(cache_file, 'wb') as f:
+                pickle.dump({
+                    'subvolumes': self._subvolumes,
+                    'molecule_ids': self._molecule_ids,
+                    'keys': self._keys
+                }, f)
+            print(f"Cached data saved to {cache_file}")
 
     def _load_data(self):
         voxel_spacing = 10  # TODO: Consider making this a parameter

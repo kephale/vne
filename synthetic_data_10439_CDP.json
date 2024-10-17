@@ -75,7 +75,7 @@
         }             
     ],
 
-    "overlay_root": "./data",
+    "overlay_root": "/root/git/quantumjot/vne/copick_data_10439",
 
     "overlay_fs_args": {
         "auto_mkdir": true
