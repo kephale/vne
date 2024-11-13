@@ -212,11 +212,7 @@ class GaussianSplatDecoder(BaseDecoder):
                 else torch.nn.Conv3d
             )
             self._decoder = torch.nn.Sequential(
-                conv(1, 32, 3, padding="same"),
-                torch.nn.ReLU(),
-                conv(32, 32, 3, padding="same"),
-                torch.nn.ReLU(),
-                conv(32, output_channels, 3, padding="same"),
+                conv(1, output_channels, kernel_size=7, padding="same")
             )
 
     def configure_renderer(

@@ -88,10 +88,17 @@ class DensitySimulator:
         self.pixel_size = pixel_size
         self.box_size = box_size
 
-        self.structures = {
-            filename.name: pdb_to_coordinates(str(filename))
-            for filename in self.filenames
-        }
+        self.structures = {}
+        for filename in self.filenames:
+            try:
+                pdb_id = filename.stem  # This gets the filename without the extension
+                self.structures[pdb_id] = pdb_to_coordinates(str(filename))
+                # logging.debug(f"Successfully loaded structure for {pdb_id}")
+            except Exception as e:
+                # logging.error(f"Failed to load structure for {filename.name}: {str(e)}")
+                pass
+
+        # logging.info(f"Loaded {len(self.structures)} structures out of {len(self.filenames)} files")
 
         self.ctf = contrast_transfer_function(
             defocus=defocus,

@@ -13,12 +13,14 @@ class CopickDataset(Dataset):
         config_path: str,
         boxsize: Tuple[int, int, int] = (32, 32, 32),
         augment: bool = False,
-        cache_dir: str = "./dataset_cache"
+        cache_dir: str = "./dataset_cache",
+        device: str = "cpu"
     ):
         self.root = copick.from_file(config_path)
         self.boxsize = boxsize
         self.augment = augment
         self.cache_dir = cache_dir
+        self.device = device 
         
         self._subvolumes = []
         self._molecule_ids = []
@@ -152,8 +154,8 @@ class CopickDataset(Dataset):
             subvolume = self._augment_subvolume(subvolume)
 
         subvolume = (subvolume - np.mean(subvolume)) / (np.std(subvolume) + 1e-6)  # Add small epsilon to avoid division by zero
-        subvolume = torch.as_tensor(subvolume[None, ...], dtype=torch.float32)
-        return subvolume, molecule_idx
+        subvolume = torch.as_tensor(subvolume[None, ...], dtype=torch.float32).to(self.device)  # Move to specified device
+        return subvolume, torch.tensor(molecule_idx, device=self.device)  # Ensure the molecule index is also on the device
 
     def _augment_subvolume(self, subvolume):
         # Implement augmentation logic here (e.g., random rotations, flips)
@@ -179,4 +181,4 @@ class CopickDataset(Dataset):
                 examples_class.append(mol_idx)
             idx += 1
 
-        return torch.stack(examples, axis=0), [self._keys[idx] for idx in examples_class]
+        return torch.stack(examples, axis=0).to(self.device), [self._keys[idx] for idx in examples_class]
