@@ -6,6 +6,8 @@ import copick
 from pathlib import Path
 import os
 import pickle
+from scipy.ndimage import gaussian_filter
+import random
 
 class CopickDataset(Dataset):
     def __init__(
@@ -14,7 +16,8 @@ class CopickDataset(Dataset):
         boxsize: Tuple[int, int, int] = (32, 32, 32),
         augment: bool = False,
         cache_dir: str = "./dataset_cache",
-        device: str = "cpu"
+        device: str = "cpu",
+        seed: Optional[int] = 1717
     ):
         self.root = copick.from_file(config_path)
         self.boxsize = boxsize
@@ -22,6 +25,9 @@ class CopickDataset(Dataset):
         self.cache_dir = cache_dir
         self.device = device 
         
+        self.seed = seed
+        self._set_random_seed()
+
         self._subvolumes = []
         self._molecule_ids = []
         self._keys = []
@@ -30,6 +36,11 @@ class CopickDataset(Dataset):
 
         if len(self._subvolumes) == 0:
             raise ValueError("No valid subvolumes found in the dataset. Please check your Copick configuration and ensure there are valid picks and tomograms.")
+
+    def _set_random_seed(self):
+        if self.seed is not None:
+            random.seed(self.seed)
+            np.random.seed(self.seed)
 
     def _load_or_process_data(self):
         cache_file = os.path.join(self.cache_dir, f"copick_cache_{self.boxsize[0]}x{self.boxsize[1]}x{self.boxsize[2]}.pkl")
@@ -70,6 +81,7 @@ class CopickDataset(Dataset):
                 print(f"Warning: Could not find tomogram for run {run.name}. Skipping this run.")
                 continue
             
+            print(f"Available picks: {run.picks}")
             for picks in run.picks:
                 if picks.from_tool:  # Only use tool-generated picks
                     object_name = picks.pickable_object_name
@@ -158,10 +170,40 @@ class CopickDataset(Dataset):
         return subvolume, torch.tensor(molecule_idx, device=self.device)  # Ensure the molecule index is also on the device
 
     def _augment_subvolume(self, subvolume):
-        # Implement augmentation logic here (e.g., random rotations, flips)
-        # For this example, we'll just add some random noise
-        noise = np.random.normal(0, 0.1, subvolume.shape)
-        return subvolume + noise
+        if random.random() < 0.5:
+            subvolume = self._brightness(subvolume)
+        if random.random() < 0.5:
+            subvolume = self._gaussian_blur(subvolume)
+        if random.random() < 0.5:
+            subvolume = self._intensity_scaling(subvolume)
+        if random.random() < 0.5:
+            subvolume = self._contrast_adjustment(subvolume)
+        subvolume, _ = self._rotation_180_degrees(subvolume, subvolume)
+        return subvolume
+
+    def _brightness(self, volume, max_delta=0.5):
+        delta = np.random.uniform(-max_delta, max_delta)
+        return volume + delta
+
+    def _gaussian_blur(self, volume, sigma_range=(0.75, 1.25)):
+        sigma = np.random.uniform(*sigma_range)
+        return gaussian_filter(volume, sigma=sigma)
+
+    def _intensity_scaling(self, volume, intensity_range=(0.5, 1.5)):
+        intensity_factor = np.random.uniform(*intensity_range)
+        return volume * intensity_factor
+
+    def _contrast_adjustment(self, volume, contrast_range=(0.5, 1.5)):
+        contrast_factor = np.random.uniform(*contrast_range)
+        mean = np.mean(volume)
+        return mean + contrast_factor * (volume - mean)
+
+    def _rotation_180_degrees(self, volume, target, augment_probability=0.8):
+        if np.random.rand() < augment_probability:
+            chosen_axis = (0, 2)  # Rotate around x-z plane
+            volume = np.rot90(volume, k=2, axes=chosen_axis)
+            target = np.rot90(target, k=2, axes=chosen_axis)
+        return volume, target
 
     def keys(self) -> List[str]:
         return self._keys
