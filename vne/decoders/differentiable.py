@@ -50,67 +50,52 @@ class GaussianSplatRenderer(BaseDecoder):
 
     def forward(
         self,
-        splats: torch.Tensor,
+        splats: torch.Tensor, 
         weights: torch.Tensor,
         sigmas: torch.Tensor,
         *,
         splat_sigma_range: Tuple[float] = (0.0, 1.0),
     ) -> torch.Tensor:
-        """Render the Gaussian splats in an image volume.
-
-        Parameters
-        ----------
-        splats : tensor
-            An (N, D, 3) tensor specifying the X,Y,Z coordinates of the D
-            gaussians for the minibatch of N images.
-        weights : tensor
-            An (N, D, 1) tensor specifying the weights of the D gaussians for
-            the minibatch of N images.In the range of 0 to 1.
-        sigmas : tensor
-            An (N, D, 1) tensor specifying the standard deviations of the D
-            gaussians for the minibatch of N images. In the range of 0 to 1.
-        splat_sigma_range : tuple
-            The minimum and maximum values for sigma. Final sigma is calculated
-            as sigmas * (max_sigma - min_sigma) + min_sigma.
-
-        Returns
-        -------
-        x : tensor
-            The rendered image volume.
-
-        Notes
-        -----
-        This isn't very memory efficient since the GMM is evaluated for every
-        voxel in the output. This means an (N, M*M*M, D) matrix, where M is the
-        dimensions of the image volume (e.g. 32x32x32) and D is the number of
-        gaussians (e.g. 1024). This leads to a matrix of 32 x 32768 x 1024
-        for a minibatch of 32 volumes.
-        """
-
-        # scale the sigma values
+        """Render the Gaussian splats with correct tensor dimensions."""
+        
+        # Clamp weights to prevent explosion
+        weights = torch.clamp(weights, 0.0, 1.0)
+        
+        # Scale the sigma values with clamping
         min_sigma, max_sigma = splat_sigma_range
-        sigmas = sigmas * (max_sigma - min_sigma) + min_sigma
-
-        # transpose keeping batch intact
-        # coords_t = torch.swapaxes(self.coords, 1, 2)
-        splats_t = torch.swapaxes(splats, 1, 2)
-
-        # calculate D^2 for all combinations of voxel and gaussian
-        D_squared = torch.sum(
-            self.coords[:, :, None, :] ** 2 + splats_t[:, None, :, :] ** 2,
-            axis=-1,
-        ) - 2 * torch.matmul(self.coords, splats)
-
-        # scale the gaussians
-        sigmas = 2.0 * sigmas[:, None, :] ** 2
-
-        # now splat the gaussians
-        x = torch.sum(
-            weights[:, None, :] * torch.exp(-D_squared / sigmas), axis=-1
+        sigmas = torch.clamp(
+            sigmas * (max_sigma - min_sigma) + min_sigma,
+            min=1e-6,
+            max=1.0
         )
 
-        return x.reshape((-1, *self._shape)).unsqueeze(1)
+        # Transpose splats for efficient computation
+        splats_t = splats.transpose(1, 2)  # [B, N, D]
 
+        # Calculate squared distances efficiently
+        coords_norm = torch.sum(self.coords ** 2, dim=-1, keepdim=True)  # [B, M, 1]
+        splats_norm = torch.sum(splats_t ** 2, dim=-1)  # [B, N]
+        
+        # Compute cross term
+        cross_term = torch.matmul(self.coords, splats)  # [B, M, N]
+        
+        # Combine terms for full distance calculation
+        D_squared = coords_norm + splats_norm.unsqueeze(1) - 2 * cross_term
+        D_squared = torch.clamp(D_squared, min=0.0)
+
+        # Scale gaussians with numerical stability
+        sigmas = 2.0 * sigmas.unsqueeze(1) ** 2  # [B, 1, N]
+        
+        # Calculate gaussian values with stability checks
+        gaussian_values = weights.unsqueeze(1) * torch.exp(
+            torch.clamp(-D_squared / sigmas, min=-88.0)
+        )
+        
+        # Sum and normalize
+        x = torch.sum(gaussian_values, dim=-1)
+        x = torch.clamp(x, 0.0, 1.0)
+
+        return x.reshape((-1, *self._shape)).unsqueeze(1)
 
 class SoftStep(torch.nn.Module):
     """Soft (differentiable) step function in the range of 0-1."""
