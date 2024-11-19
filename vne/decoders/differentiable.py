@@ -29,7 +29,7 @@ class GaussianSplatRenderer(BaseDecoder):
             raise ValueError("Only 2D or 3D rotations are currently supported")
 
         grids = torch.meshgrid(
-            *[torch.linspace(-1, 1, sz) for sz in shape],
+            *[torch.linspace(-1, 1, sz, device=device) for sz in shape],
             indexing="xy",
         )
 
@@ -250,9 +250,12 @@ class GaussianSplatDecoder(BaseDecoder):
             )
 
         # predict the centroids for the splats
-        splats = self.centroids(z).view(z.shape[0], 3, -1)
-        weights = self.weights(z)
-        sigmas = self.sigmas(z)
+        z = z.to(self._device)
+        pose = pose.to(self._device)
+        splats = self.centroids(z).view(z.shape[0], 3, -1).to(self._device)
+        weights = self.weights(z).to(self._device)
+        sigmas = self.sigmas(z).to(self._device)
+
 
         # get the batch size
         batch_size = z.shape[0]
@@ -273,13 +276,13 @@ class GaussianSplatDecoder(BaseDecoder):
         quaternions = axis_angle_to_quaternion(pose, normalize=True)
 
         # convert the quaternions to rotation matrices
-        rotation_matrices = quaternion_to_rotation_matrix(quaternions)
+        rotation_matrices = quaternion_to_rotation_matrix(quaternions).to(self._device)
 
         # rotate the 3D points using the rotation matrices
         rotated_splats = torch.matmul(
             rotation_matrices,
             splats,
-        )
+        ).to(self._device)
 
         # use only the required spatial dimensions (batch, ndim, samples)
         rotated_splats = rotated_splats[:, : self._ndim, :]

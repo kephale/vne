@@ -27,19 +27,14 @@ def process(
     device: torch.device = torch.device("cpu"),
     use_conv: bool = False,
 ) -> npt.NDArray:
-    z = torch.tensor(
-        np.array([z], dtype=np.float32),
-        device=device,
-    )
-    pose = torch.tensor(
-        np.array([pose], dtype=np.float32),
-        device=device,
-    )
+    z = torch.tensor(np.array([z], dtype=np.float32), device=device)
+    pose = torch.tensor(np.array([pose], dtype=np.float32), device=device)
 
-    with torch.inference_mode():
+    with torch.no_grad():
         x = model.decoder.forward(z, pose, use_final_convolution=use_conv)
 
     return x.squeeze().cpu().numpy()
+
 
 
 def scale_from_slider(x, s):
@@ -239,6 +234,8 @@ class GenerativeAffinityVAEWidget(QtWidgets.QWidget):
         self._layer.data = process(
             self._model, z, pose, device=self._device, use_conv=use_conv
         )
+
+        torch.mps.empty_cache()
 
     def set_embedding(
         self,
