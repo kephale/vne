@@ -192,12 +192,16 @@ class GaussianSplatDecoder(BaseDecoder):
         # of output channels has been provided
         if output_channels is not None:
             conv = (
-                torch.nn.Conv2d
-                if self._ndim == SpatialDims.TWO
-                else torch.nn.Conv3d
+                torch.nn.Conv3d
+                if self._ndim == SpatialDims.THREE
+                else torch.nn.Conv2d
             )
+
+            # New final convolutional decoder pipeline
             self._decoder = torch.nn.Sequential(
-                conv(1, output_channels, kernel_size=7, padding="same")
+                torch.nn.Lambda(lambda x: -x),  # Negate the density
+                conv(1, 1, kernel_size=1),  # Scaling and offset (1x1x1 convolution)
+                conv(1, output_channels, kernel_size=9, padding="same"),  # Learn the CTF
             )
 
     def configure_renderer(
