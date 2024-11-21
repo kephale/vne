@@ -107,6 +107,10 @@ class SoftStep(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return 1.0 / (1.0 + torch.exp(-self.k * x))
 
+class Negate(torch.nn.Module):
+    def forward(self, x):
+        return -x
+
 
 class GaussianSplatDecoder(BaseDecoder):
     """Differentiable Gaussian splat decoder.
@@ -199,7 +203,7 @@ class GaussianSplatDecoder(BaseDecoder):
 
             # New final convolutional decoder pipeline
             self._decoder = torch.nn.Sequential(
-                torch.nn.Lambda(lambda x: -x),  # Negate the density
+                Negate(),  # Negate the density (electron density)
                 conv(1, 1, kernel_size=1),  # Scaling and offset (1x1x1 convolution)
                 conv(1, output_channels, kernel_size=9, padding="same"),  # Learn the CTF
             )
