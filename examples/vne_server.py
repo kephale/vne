@@ -26,14 +26,21 @@ elif torch.backends.mps.is_available():
 else:
     DEVICE = torch.device('cpu')
     logger.info("Using CPU device")
+    
+
+# Configurable crop size
+CROP_SIZE = (48, 48, 48)  # Default crop size (can be changed dynamically)
 
 # Define model parameters
-encoder = Encoder3D(input_shape=(96, 96, 96), layer_channels=(8, 16, 32, 64)).to(DEVICE)
-decoder = GaussianSplatDecoder((96, 96, 96), latent_dims=8, n_splats=768, output_channels=1, splat_sigma_range=(0.02, 0.1), device=DEVICE)
+encoder = Encoder3D(input_shape=CROP_SIZE, layer_channels=(8, 16, 32, 64)).to(DEVICE)
+decoder = GaussianSplatDecoder(CROP_SIZE, latent_dims=8, n_splats=768, output_channels=1, splat_sigma_range=(0.02, 0.1), device=DEVICE)
 model = AffinityVAE(encoder=encoder, decoder=decoder, latent_dims=8, pose_channels=4).to(DEVICE)
 
 # Load the model state dict
-state_dict_path = "/mnt/czi-sci-ai/imaging-models/kyle/experiments/cryolens_mlchallenge/train_mlc_1731606498/density_sim_vae_epoch_epoch=4.ckpt"
+# state_dict_path = "/mnt/czi-sci-ai/imaging-models/kyle/experiments/cryolens_mlchallenge/train_mlc_1731606498/density_sim_vae_epoch_epoch=4.ckpt"
+# state_dict_path = "/mnt/czi-sci-ai/imaging-models/kyle/experiments/cryolens_mlchallenge/train_mlc_1732135115/density_sim_vae_epoch_epoch=39.ckpt"
+# 48s
+state_dict_path = "/mnt/czi-sci-ai/imaging-models/kyle/experiments/cryolens_mlchallenge/train_mlc_1732223081/density_sim_vae_epoch_epoch=404.ckpt"
 state_dict = torch.load(state_dict_path, map_location=DEVICE)
 model_state_dict = state_dict["state_dict"]
 updated_state_dict = {k.replace("model.", ""): v for k, v in model_state_dict.items()}
@@ -79,9 +86,8 @@ async def get_latent_vector(request: LatentVectorRequest):
         z = zarr.open(tomogram_data.zarr(), "r")["0"]
         
         # Validate and adjust coordinates to make them the crop center
-        crop_size = (96, 96, 96)
         coords = np.array(request.coordinates)
-        half_crop_size = np.array(crop_size) // 2
+        half_crop_size = np.array(CROP_SIZE) // 2
 
         # Calculate crop bounds based on the center
         start = coords - half_crop_size
@@ -148,9 +154,8 @@ async def get_reconstruction(request: LatentVectorRequest):
         z = zarr.open(tomogram_data.zarr(), "r")["0"]
         
         # Validate and adjust coordinates to make them the crop center
-        crop_size = (96, 96, 96)
         coords = np.array(request.coordinates)
-        half_crop_size = np.array(crop_size) // 2
+        half_crop_size = np.array(CROP_SIZE) // 2
 
         # Calculate crop bounds based on the center
         start = coords - half_crop_size
@@ -180,11 +185,14 @@ async def get_reconstruction(request: LatentVectorRequest):
             # Get latent variables and pose
             mu, log_var, pose = model.encode(input_tensor)  # Encode input to latent space
             z = model.reparameterise(mu, log_var)  # Reparameterize to sample z
-            reconstructed = model.decoder(z, pose)  # Decode z and pose to reconstruct
+            # reconstructed = model.decoder(z, pose)  # Decode z and pose to reconstruct
+            reconstructed = model.decoder(z, pose, use_final_convolution=False)  # Decode z and pose to reconstruct
+            # reconstructed = model.decoder(z, pose, use_final_convolution=True)  # Decode z and pose to reconstruct
             
         # Return the reconstruction as a list of numbers
         return {
-            "reconstruction": reconstructed.squeeze().cpu().numpy().tolist()
+            "reconstruction": reconstructed.squeeze().cpu().numpy().tolist(),
+            "pose": pose.squeeze().cpu().numpy().tolist(),
         }
     
     except Exception as e:
