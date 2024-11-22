@@ -8,6 +8,7 @@ import os
 import pickle
 from scipy.ndimage import gaussian_filter
 import random
+from collections import Counter
 
 class CopickDataset(Dataset):
     def __init__(
@@ -31,11 +32,28 @@ class CopickDataset(Dataset):
         self._subvolumes = []
         self._molecule_ids = []
         self._keys = []
+        self.difficulty_scores = None
         
         self._load_or_process_data()
 
         if len(self._subvolumes) == 0:
             raise ValueError("No valid subvolumes found in the dataset. Please check your Copick configuration and ensure there are valid picks and tomograms.")
+
+        self._compute_sample_weights()        
+
+    def _compute_sample_weights(self):
+        """
+        Compute sample weights based on class frequency for balancing.
+        """
+        class_counts = Counter(self._molecule_ids)
+        total_samples = len(self._molecule_ids)
+
+        # Calculate weight for each class
+        class_weights = {cls: total_samples / count for cls, count in class_counts.items()}
+
+        # Assign weights to each sample based on its class
+        self.sample_weights = [class_weights[mol_id] for mol_id in self._molecule_ids]
+
 
     def _set_random_seed(self):
         if self.seed is not None:
@@ -168,6 +186,12 @@ class CopickDataset(Dataset):
         subvolume = (subvolume - np.mean(subvolume)) / (np.std(subvolume) + 1e-6)  # Add small epsilon to avoid division by zero
         subvolume = torch.as_tensor(subvolume[None, ...], dtype=torch.float32).to(self.device)  # Move to specified device
         return subvolume, torch.tensor(molecule_idx, device=self.device)  # Ensure the molecule index is also on the device
+
+    def get_sample_weights(self):
+        """
+        Returns the computed sample weights for use in a WeightedRandomSampler.
+        """
+        return self.sample_weights
 
     def _augment_subvolume(self, subvolume):
         if random.random() < 0.5:
