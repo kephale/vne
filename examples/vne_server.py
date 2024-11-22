@@ -33,7 +33,7 @@ decoder = GaussianSplatDecoder((96, 96, 96), latent_dims=8, n_splats=768, output
 model = AffinityVAE(encoder=encoder, decoder=decoder, latent_dims=8, pose_channels=4).to(DEVICE)
 
 # Load the model state dict
-state_dict_path = "/Users/kharrington/Data/vne/mlc/density_sim_vae_epoch_epoch=4.ckpt"
+state_dict_path = "/mnt/czi-sci-ai/imaging-models/kyle/experiments/cryolens_mlchallenge/train_mlc_1731606498/density_sim_vae_epoch_epoch=4.ckpt"
 state_dict = torch.load(state_dict_path, map_location=DEVICE)
 model_state_dict = state_dict["state_dict"]
 updated_state_dict = {k.replace("model.", ""): v for k, v in model_state_dict.items()}
@@ -62,7 +62,7 @@ async def get_latent_vector(request: LatentVectorRequest):
     """
     try:
         # Load Copick configuration and Zarr data
-        COPICK_CONFIG_PATH = "/Users/kharrington/Data/copick/CZCDP_10048_local.json"
+        COPICK_CONFIG_PATH = "/mnt/czi-sci-ai/imaging-models/kyle/experiments/cryolens_mlchallenge/ml_challenge.json"
         root = copick.from_file(COPICK_CONFIG_PATH)
         
         # Ensure the requested run exists
@@ -78,19 +78,30 @@ async def get_latent_vector(request: LatentVectorRequest):
         tomogram_data = run_data.voxel_spacings[request.voxel_spacing].get_tomogram(request.tomogram)
         z = zarr.open(tomogram_data.zarr(), "r")["0"]
         
-        # Validate the coordinates and crop size
+        # Validate and adjust coordinates to make them the crop center
         crop_size = (96, 96, 96)
-        coords = request.coordinates
-        if any(c < 0 or c + cs > s for c, cs, s in zip(coords, crop_size, z.shape)):
-            raise HTTPException(status_code=400, detail="Invalid coordinates or crop size.")
+        coords = np.array(request.coordinates)
+        half_crop_size = np.array(crop_size) // 2
+
+        # Calculate crop bounds based on the center
+        start = coords - half_crop_size
+        end = coords + half_crop_size
+
+        # Adjust bounds to stay within Zarr shape limits
+        if np.any(start < 0) or np.any(end > z.shape):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Crop exceeds bounds. Adjusted start: {start}, end: {end}, zarr shape: {z.shape}"
+            )
         
         # Fetch and normalize crop
         crop = z[
-            coords[0]:coords[0] + crop_size[0],
-            coords[1]:coords[1] + crop_size[1],
-            coords[2]:coords[2] + crop_size[2],
+            start[0]:end[0],
+            start[1]:end[1],
+            start[2]:end[2],
         ]
-        crop = crop / crop.max()
+        crop = (crop - np.mean(crop)) / (np.std(crop) + 1e-6)
+        # crop = crop / crop.max()
         
         # Prepare input tensor
         input_tensor = torch.tensor(crop, dtype=torch.float32, device=DEVICE).unsqueeze(0).unsqueeze(0)
@@ -111,5 +122,73 @@ async def get_latent_vector(request: LatentVectorRequest):
     except Exception as e:
         # Log the error
         logger.exception("Error processing request: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/reconstruction")
+async def get_reconstruction(request: LatentVectorRequest):
+    """
+    Endpoint to fetch the full reconstruction for the given run, voxel spacing, tomogram, and coordinates.
+    """
+    try:
+        # Load Copick configuration and Zarr data
+        COPICK_CONFIG_PATH = "/mnt/czi-sci-ai/imaging-models/kyle/experiments/cryolens_mlchallenge/ml_challenge.json"
+        root = copick.from_file(COPICK_CONFIG_PATH)
+        
+        # Ensure the requested run exists
+        if request.run >= len(root.runs):
+            raise HTTPException(status_code=400, detail="Invalid run index.")
+        
+        # Ensure the requested voxel spacing exists
+        run_data = root.runs[request.run]
+        if request.voxel_spacing >= len(run_data.voxel_spacings):
+            raise HTTPException(status_code=400, detail="Invalid voxel spacing index.")
+        
+        # Load the requested tomogram
+        tomogram_data = run_data.voxel_spacings[request.voxel_spacing].get_tomogram(request.tomogram)
+        z = zarr.open(tomogram_data.zarr(), "r")["0"]
+        
+        # Validate and adjust coordinates to make them the crop center
+        crop_size = (96, 96, 96)
+        coords = np.array(request.coordinates)
+        half_crop_size = np.array(crop_size) // 2
+
+        # Calculate crop bounds based on the center
+        start = coords - half_crop_size
+        end = coords + half_crop_size
+
+        # Adjust bounds to stay within Zarr shape limits
+        if np.any(start < 0) or np.any(end > z.shape):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Crop exceeds bounds. Adjusted start: {start}, end: {end}, zarr shape: {z.shape}"
+            )
+        
+        # Fetch and normalize crop
+        crop = z[
+            start[0]:end[0],
+            start[1]:end[1],
+            start[2]:end[2],
+        ]
+        crop = (crop - np.mean(crop)) / (np.std(crop) + 1e-6)
+        # crop = crop / crop.max()
+        
+        # Prepare input tensor
+        input_tensor = torch.tensor(crop, dtype=torch.float32, device=DEVICE).unsqueeze(0).unsqueeze(0)
+        
+        # Compute reconstruction
+        with torch.no_grad():
+            # Get latent variables and pose
+            mu, log_var, pose = model.encode(input_tensor)  # Encode input to latent space
+            z = model.reparameterise(mu, log_var)  # Reparameterize to sample z
+            reconstructed = model.decoder(z, pose)  # Decode z and pose to reconstruct
+            
+        # Return the reconstruction as a list of numbers
+        return {
+            "reconstruction": reconstructed.squeeze().cpu().numpy().tolist()
+        }
+    
+    except Exception as e:
+        # Log the error
+        logger.exception("Error processing reconstruction request: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
