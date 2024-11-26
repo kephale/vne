@@ -10,6 +10,24 @@ from vne.decoders.spatial import (
 
 from typing import Optional, Tuple
 
+# From https://github.com/alan-turing-institute/affinity-vae/blob/gsd_binarised_weights_single_conv_lager/avae/decoders/differentiable.py
+class STEFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input):
+        return (input > 0).float()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return torch.nn.functional.hardtanh(grad_output)
+
+
+class StraightThroughEstimator(torch.nn.Module):
+    def __init__(self):
+        super(StraightThroughEstimator, self).__init__()
+
+    def forward(self, x):
+        x = STEFunction.apply(x)
+        return x
 
 class GaussianSplatRenderer(BaseDecoder):
     """Perform gaussian splatting."""
@@ -170,8 +188,9 @@ class GaussianSplatDecoder(BaseDecoder):
         # NOTE(arl): not sure if this really makes any difference
         self.weights = torch.nn.Sequential(
             torch.nn.Linear(latent_dims, n_splats),
-            torch.nn.Tanh(),
-            SoftStep(k=10.0),
+            # torch.nn.Tanh(),
+            # SoftStep(k=10.0),
+            StraightThroughEstimator(),
         )
 
         # sigma ends up being scaled by `splat_sigma_range`
