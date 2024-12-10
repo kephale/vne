@@ -40,7 +40,8 @@ model = AffinityVAE(encoder=encoder, decoder=decoder, latent_dims=8, pose_channe
 # state_dict_path = "/mnt/czi-sci-ai/imaging-models/kyle/experiments/cryolens_mlchallenge/train_mlc_1731606498/density_sim_vae_epoch_epoch=4.ckpt"
 # state_dict_path = "/mnt/czi-sci-ai/imaging-models/kyle/experiments/cryolens_mlchallenge/train_mlc_1732135115/density_sim_vae_epoch_epoch=39.ckpt"
 # 48s
-state_dict_path = "/mnt/czi-sci-ai/imaging-models/kyle/experiments/cryolens_mlchallenge/train_mlc_1732223081/density_sim_vae_epoch_epoch=404.ckpt"
+# state_dict_path = "/mnt/czi-sci-ai/imaging-models/kyle/experiments/cryolens_mlchallenge/train_mlc_1732223081/density_sim_vae_epoch_epoch=404.ckpt"
+state_dict_path = "/mnt/czi-sci-ai/imaging-models/kyle/experiments/cryolens_mlchallenge/train_mlc_1732308833/density_sim_vae_epoch_epoch=1949.ckpt"
 state_dict = torch.load(state_dict_path, map_location=DEVICE)
 model_state_dict = state_dict["state_dict"]
 updated_state_dict = {k.replace("model.", ""): v for k, v in model_state_dict.items()}

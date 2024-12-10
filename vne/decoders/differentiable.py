@@ -188,9 +188,9 @@ class GaussianSplatDecoder(BaseDecoder):
         # NOTE(arl): not sure if this really makes any difference
         self.weights = torch.nn.Sequential(
             torch.nn.Linear(latent_dims, n_splats),
-            # torch.nn.Tanh(),
-            # SoftStep(k=10.0),
-            StraightThroughEstimator(),
+            torch.nn.Tanh(),
+            SoftStep(k=10.0),
+            # StraightThroughEstimator(),
         )
 
         # sigma ends up being scaled by `splat_sigma_range`
