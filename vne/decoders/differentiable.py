@@ -180,6 +180,8 @@ class GaussianSplatDecoder(BaseDecoder):
         # centroids should be in the range of (-1, 1)
         self.centroids = torch.nn.Sequential(
             torch.nn.Linear(latent_dims, n_splats * 3),
+            torch.nn.ReLU(),
+            torch.nn.Linear(n_splats * 3, n_splats * 3),
             torch.nn.Tanh(),
         )
 
@@ -189,8 +191,8 @@ class GaussianSplatDecoder(BaseDecoder):
         self.weights = torch.nn.Sequential(
             torch.nn.Linear(latent_dims, n_splats),
             torch.nn.Tanh(),
-            # SoftStep(k=10.0),
-            StraightThroughEstimator(),
+            SoftStep(k=10.0),
+            # StraightThroughEstimator(),
         )
 
         # sigma ends up being scaled by `splat_sigma_range`
