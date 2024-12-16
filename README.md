@@ -26,3 +26,14 @@ pip install -e .
 ```sh
 pip install -e ".[dev]"
 ```
+
+Launch mlflow server:
+
+```
+mlflow server --host 127.0.0.1 --port 5000
+```
+
+ddp training
+```
+torchrun --nproc_per_node=4 examples/train_mlc_ddp.py --num_nodes 1 --devices 4 --strategy ddp
+```

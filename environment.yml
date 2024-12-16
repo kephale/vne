@@ -1,4 +1,4 @@
-name: vne
+name: cryolens
 channels:
   - conda-forge
 dependencies:
@@ -10,13 +10,14 @@ dependencies:
   - scikit-image
   - scikit-learn
   - scipy
-  - pytorch
-  - pytorch-lightning
-  - torchvision
   - ipykernel
+  - fastapi
   - pip
   - pip:
       - pathos
       - copick
       - gemmi
       - dscribe
+      - torch
+      - pytorch-lightning
+      - torchvision
