@@ -1,4 +1,7 @@
 import torch
+from torch import nn
+
+import numpy as np
 
 from vne.decoders.base import BaseDecoder
 from vne.decoders.spatial import (
@@ -342,4 +345,192 @@ class GaussianSplatDecoder(BaseDecoder):
         if self._output_channels is not None and use_final_convolution:
             x = self._decoder(x)
 
+        return x
+
+class TransformerGaussianDecoder(BaseDecoder):
+    def __init__(
+        self,
+        shape: Tuple[int],
+        n_gaussians_range: Tuple[int, int] = (16, 128),
+        latent_dims: int = 8,
+        d_model: int = 128,
+        nhead: int = 8,
+        num_layers: int = 6,
+        output_channels: Optional[int] = None,
+        device: torch.device = torch.device("cpu"),
+    ):
+        super().__init__()
+        
+        self._shape = shape
+        self._device = device
+        self._ndim = len(shape)
+        self._output_channels = output_channels
+        self._n_gaussians_range = n_gaussians_range
+        self._d_model = d_model
+
+        # Sequence length predictor
+        self.sequence_length = nn.Sequential(
+            nn.Linear(latent_dims, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+
+        # Project latent vector to transformer dimension
+        self.latent_projection = nn.Linear(latent_dims, d_model)
+        
+        # Transformer decoder layers
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * 4,
+            batch_first=True,
+            dropout=0.1
+        )
+        self.transformer_decoder = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=num_layers
+        )
+        
+        # Learned query embeddings
+        self.query_embed = nn.Embedding(n_gaussians_range[1], d_model)
+        
+        # Project transformer outputs to Gaussian parameters
+        self.gaussian_params = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, 7)  # x,y,z position + amplitude + sigma_x,y,z
+        )
+        
+        if output_channels is not None:
+            conv = nn.Conv3d if self._ndim == 3 else nn.Conv2d
+            self.final_conv = nn.Sequential(
+                conv(1, 16, kernel_size=3, padding=1),
+                nn.ReLU(),
+                conv(16, output_channels, kernel_size=1)
+            )
+
+    def _generate_gaussian_grid(self, positions, amplitudes, sigmas):
+        """Generate grid of Gaussian values."""
+        device = positions.device
+        batch_size = positions.shape[0]
+
+        # Create coordinate grid
+        coords = [torch.linspace(-1, 1, s, device=device) for s in self._shape]
+        grid_points = torch.meshgrid(*coords, indexing='ij')
+        grid_coords = torch.stack([g.reshape(-1) for g in grid_points], dim=-1)
+        
+        # Reshape positions and parameters for broadcasting
+        positions = positions.view(batch_size, -1, positions.shape[-1])  # [batch, N, 3]
+        sigmas = sigmas.view(batch_size, -1, sigmas.shape[-1])  # [batch, N, 3]
+        amplitudes = amplitudes.view(batch_size, -1)  # [batch, N]
+        
+        # Calculate distances efficiently
+        grid_coords = grid_coords.unsqueeze(0).unsqueeze(2)  # [1, P, 1, 3]
+        positions = positions.unsqueeze(1)  # [batch, 1, N, 3]
+        sigmas = sigmas.unsqueeze(1)  # [batch, 1, N, 3]
+        amplitudes = amplitudes.unsqueeze(1)  # [batch, 1, N]
+        
+        # Calculate squared distances
+        diff = (grid_coords - positions) / (sigmas + 1e-6)
+        dist_sq = torch.sum(diff * diff, dim=-1)
+        
+        # Calculate Gaussian values
+        gaussians = amplitudes * torch.exp(-0.5 * dist_sq)
+        
+        # Sum over Gaussians
+        result = torch.sum(gaussians, dim=-1)
+        
+        # Reshape to spatial dimensions
+        result = result.view(batch_size, 1, *self._shape)
+        
+        return result
+
+    def decode_sequence(self, z: torch.Tensor):
+        """Decode latent vector into sequence of Gaussian parameters."""
+        batch_size = z.shape[0]
+        
+        # Predict sequence length - modify to ensure valid range
+        seq_len_ratio = self.sequence_length(z).squeeze(-1)  # Shape: [batch_size]
+        min_len, max_len = self._n_gaussians_range
+        
+        # Calculate number of gaussians for each batch element
+        n_gaussians = min_len + (max_len - min_len) * seq_len_ratio
+        n_gaussians = n_gaussians.round().long()  # Convert to integer
+        
+        # Use max_len for all sequences to avoid inconsistent sizes
+        # We'll mask unused positions later
+        query_embeddings = self.query_embed.weight[:max_len].unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # Project latent vector
+        memory = self.latent_projection(z).unsqueeze(1)  # [batch_size, 1, d_model]
+        
+        # Generate sequence with transformer
+        transformer_out = self.transformer_decoder(
+            query_embeddings,
+            memory
+        )
+        
+        # Convert to Gaussian parameters
+        params = self.gaussian_params(transformer_out)
+        
+        # Split parameters
+        positions = params[..., :self._ndim].tanh()  # Positions in [-1,1]
+        amplitudes = params[..., self._ndim].sigmoid()  # Amplitudes in [0,1]
+        sigmas = 0.1 + 0.9 * params[..., self._ndim+1:].sigmoid()  # Sigmas in [0.1,1]
+        
+        # Create mask for valid positions
+        batch_indices = torch.arange(batch_size, device=z.device)
+        position_mask = torch.arange(max_len, device=z.device).unsqueeze(0) < n_gaussians.unsqueeze(1)
+        
+        # Apply mask
+        positions = positions * position_mask.unsqueeze(-1)
+        amplitudes = amplitudes * position_mask
+        sigmas = sigmas * position_mask.unsqueeze(-1)
+        
+        return positions, amplitudes, sigmas
+
+    def decode_splats(self, z: torch.Tensor, pose: torch.Tensor) -> Tuple[torch.Tensor]:
+        """Decode the splats to retrieve the coordinates, weights and sigmas."""
+        # Get sequence of Gaussian parameters
+        positions, amplitudes, sigmas = self.decode_sequence(z)
+        
+        # Reshape outputs for compatibility with other decoders
+        batch_size = positions.shape[0]
+        n_gaussians = positions.shape[1]
+        
+        # Reshape positions to match expected format (batch, 3, n_gaussians)
+        rotated_splats = positions.transpose(1, 2)
+        
+        # Add third spatial dimension if needed
+        if rotated_splats.shape[1] == 2:
+            zeros = torch.zeros(batch_size, 1, n_gaussians, device=z.device)
+            rotated_splats = torch.cat([rotated_splats, zeros], dim=1)
+        
+        # Convert amplitudes and sigmas to expected format
+        weights = amplitudes  # Already in correct shape (batch, n_gaussians)
+        
+        # Ensure sigmas has correct shape (batch, n_gaussians)
+        if len(sigmas.shape) == 3:  # If we have different sigma per dimension
+            sigmas = torch.mean(sigmas, dim=2)  # Average across dimensions
+        
+        return rotated_splats, weights, sigmas
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        pose: torch.Tensor,
+        *,
+        use_final_convolution: bool = True,
+    ) -> torch.Tensor:
+        # Get sequence of Gaussian parameters
+        positions, amplitudes, sigmas = self.decode_sequence(z)
+        
+        # Generate Gaussian grid
+        x = self._generate_gaussian_grid(positions, amplitudes, sigmas)
+        
+        # Optional final convolution
+        if self._output_channels is not None and use_final_convolution:
+            x = self.final_conv(x)
+            
         return x
