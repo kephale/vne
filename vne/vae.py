@@ -60,7 +60,7 @@ class ShapeSimilarityLoss:
         return loss
 
 
-class AffinityCosineLoss:
+class AffinityCosineLoss(torch.nn.Module):
     """Affinity loss based on pre-calculated shape similarity.
 
     Parameters
@@ -79,13 +79,14 @@ class AffinityCosineLoss:
     """
 
     def __init__(self, lookup: torch.Tensor, device: torch.device, latent_ratio: float = 0.75):
+        super().__init__()
         self.device = device
-        self.lookup = torch.tensor(lookup).to(device)
+        self.register_buffer('lookup', torch.tensor(lookup, device=device))
         self.cos = torch.nn.CosineSimilarity(dim=1, eps=1e-8)
         self.l1loss = torch.nn.L1Loss(reduction="none")  # Use "none" for per-sample loss
         self.latent_ratio = latent_ratio
 
-    def __call__(
+    def forward(
         self, y_true: torch.Tensor, y_pred: torch.Tensor, per_sample: bool = False
     ) -> torch.Tensor:
         """Return the affinity loss.
@@ -108,6 +109,10 @@ class AffinityCosineLoss:
             The affinity loss. If `per_sample` is True, returns a tensor of
             per-sample losses for each pair. Otherwise, returns the mean loss.
         """
+        # Make sure inputs are on the correct device
+        y_true = y_true.to(self.device)
+        y_pred = y_pred.to(self.device)
+
         # Calculate number of dimensions to use
         n_dims = y_pred.shape[1]
         n_dims_to_use = int(n_dims * self.latent_ratio)
@@ -115,17 +120,15 @@ class AffinityCosineLoss:
         # Use only a portion of the latent dimensions
         y_pred_partial = y_pred[:, :n_dims_to_use]
 
-        # Calculate affinity from the lookup table for real classes
-        c = (
-            torch.combinations(y_true, r=2, with_replacement=False)
-            .to(self.device)
-            .long()
-        )
-        affinity = self.lookup[c[:, 0], c[:, 1]].to(self.device)
-
-        # Calculate latent similarity using partial dimensions
+        # Calculate combinations on device
         z_id = torch.arange(y_pred_partial.shape[0], device=self.device)
+        c = torch.combinations(y_true, r=2, with_replacement=False)
         c_latent = torch.combinations(z_id, r=2, with_replacement=False)
+
+        # Get affinity from lookup table
+        affinity = self.lookup[c[:, 0].long(), c[:, 1].long()]
+
+        # Calculate latent similarity
         latent_similarity = self.cos(
             y_pred_partial[c_latent[:, 0], :], 
             y_pred_partial[c_latent[:, 1], :]
@@ -138,6 +141,9 @@ class AffinityCosineLoss:
             return losses
         else:
             return torch.mean(losses)
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
 
 
 

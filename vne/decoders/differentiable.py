@@ -42,32 +42,24 @@ class GaussianSplatRenderer(BaseDecoder):
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__()
-
         self._shape = shape
         self._ndim = len(shape)
 
         if len(shape) not in (SpatialDims.TWO, SpatialDims.THREE):
             raise ValueError("Only 2D or 3D rotations are currently supported")
 
+        # Create coordinate grid and register as buffer for proper device management
         grids = torch.meshgrid(
-            *[torch.linspace(-1, 1, sz, device=device) for sz in shape],
+            *[torch.linspace(-1, 1, sz) for sz in shape],
             indexing="xy",
         )
 
         # add all zeros for z- if we have a 2d grid
         if len(shape) == SpatialDims.TWO:
-            grids += (
-                torch.zeros_like(
-                    grids[0],
-                ),
-            )
+            grids += (torch.zeros_like(grids[0]),)
 
-        self.coords = (
-            torch.stack([torch.ravel(grid) for grid in grids], axis=0)
-            .transpose(0, 1)
-            .unsqueeze(0)
-            .to(device)
-        )
+        coords = torch.stack([torch.ravel(grid) for grid in grids], axis=0).transpose(0, 1).unsqueeze(0)
+        self.register_buffer('coords', coords)
 
     def forward(
         self,
@@ -78,6 +70,12 @@ class GaussianSplatRenderer(BaseDecoder):
         splat_sigma_range: Tuple[float] = (0.0, 1.0),
     ) -> torch.Tensor:
         """Render the Gaussian splats with correct tensor dimensions."""
+        
+        # Ensure all inputs are on the same device as coords
+        device = self.coords.device
+        splats = splats.to(device)
+        weights = weights.to(device)
+        sigmas = sigmas.to(device)
         
         # Clamp weights to prevent explosion
         weights = torch.clamp(weights, 0.0, 1.0)
@@ -180,44 +178,39 @@ class GaussianSplatDecoder(BaseDecoder):
     ):
         super().__init__()
 
-        # centroids should be in the range of (-1, 1)
+        self._device = device
+        self._shape = shape
+        self._ndim = len(shape)
+        self._output_channels = output_channels
+        self._splat_sigma_range = splat_sigma_range
+        self._default_axis = default_axis.as_tensor()
+
+        # Register networks and move to specified device
         self.centroids = torch.nn.Sequential(
             torch.nn.Linear(latent_dims, n_splats * 3),
             torch.nn.ReLU(),
             torch.nn.Linear(n_splats * 3, n_splats * 3),
             torch.nn.Tanh(),
-        )
+        ).to(device)
 
-        # weights are effectively whether a splat is used or not
-        # use a soft step function to make this `binary` (but differentiable)
-        # NOTE(arl): not sure if this really makes any difference
         self.weights = torch.nn.Sequential(
             torch.nn.Linear(latent_dims, n_splats),
             torch.nn.Tanh(),
             SoftStep(k=10.0),
-            # StraightThroughEstimator(),
-        )
+        ).to(device)
 
-        # sigma ends up being scaled by `splat_sigma_range`
         self.sigmas = torch.nn.Sequential(
             torch.nn.Linear(latent_dims, n_splats),
             torch.nn.Sigmoid(),
-        )
+        ).to(device)
 
-        # now set up the differentiable renderer
-        self.configure_renderer(
+        # Initialize renderer
+        self._splatter = GaussianSplatRenderer(
             shape,
-            splat_sigma_range=splat_sigma_range,
-            default_axis=default_axis,
             device=device,
-        )
+        ).to(device)
 
-        self._device = device
-        self._ndim = len(shape)
-        self._output_channels = output_channels
-
-        # add a final convolutional decoder to generate an image if the number
-        # of output channels has been provided
+        # Add final conv decoder if needed
         if output_channels is not None:
             conv = (
                 torch.nn.Conv3d
@@ -225,12 +218,11 @@ class GaussianSplatDecoder(BaseDecoder):
                 else torch.nn.Conv2d
             )
 
-            # New final convolutional decoder pipeline
             self._decoder = torch.nn.Sequential(
-                Negate(),  # Negate the density (electron density)
-                conv(1, 1, kernel_size=1),  # Scaling and offset (1x1x1 convolution)
-                conv(1, output_channels, kernel_size=9, padding="same"),  # Learn the CTF
-            )
+                Negate(),
+                conv(1, 1, kernel_size=1),
+                conv(1, output_channels, kernel_size=9, padding="same"),
+            ).to(device)
 
     def configure_renderer(
         self,
@@ -266,45 +258,45 @@ class GaussianSplatDecoder(BaseDecoder):
                 "`default_axis` or a full angle-axis representation in 3D. "
             )
 
-        # predict the centroids for the splats
+        # Move inputs to correct device and predict parameters
         z = z.to(self._device)
         pose = pose.to(self._device)
-        splats = self.centroids(z).view(z.shape[0], 3, -1).to(self._device)
-        weights = self.weights(z).to(self._device)
-        sigmas = self.sigmas(z).to(self._device)
+        
+        splats = self.centroids(z).view(z.shape[0], 3, -1)
+        weights = self.weights(z)
+        sigmas = self.sigmas(z)
 
-
-        # get the batch size
+        # Get batch size
         batch_size = z.shape[0]
 
-        # in the case where the encoded pose only has one dimension, we need to
-        # use the pose as a rotation about the z-axis
+        # Handle single dimension pose
         if pose.shape[-1] == 1:
             pose = torch.concat(
                 [
                     pose,
-                    torch.tile(self._default_axis, (batch_size, 1)),
+                    torch.tile(self._default_axis, (batch_size, 1)).to(self._device),
                 ],
                 axis=-1,
             )
 
-        # convert axis angles to quaternions
+        # Convert axis angles to quaternions
         assert pose.shape[-1] == 4, pose.shape
         quaternions = axis_angle_to_quaternion(pose, normalize=True)
 
-        # convert the quaternions to rotation matrices
-        rotation_matrices = quaternion_to_rotation_matrix(quaternions).to(self._device)
+        # Convert quaternions to rotation matrices
+        rotation_matrices = quaternion_to_rotation_matrix(quaternions)
 
-        # rotate the 3D points using the rotation matrices
+        # Rotate the 3D points using the rotation matrices
         rotated_splats = torch.matmul(
             rotation_matrices,
             splats,
-        ).to(self._device)
+        )
 
-        # use only the required spatial dimensions (batch, ndim, samples)
-        rotated_splats = rotated_splats[:, : self._ndim, :]
+        # Use only the required spatial dimensions
+        rotated_splats = rotated_splats[:, :self._ndim, :]
 
         return rotated_splats, weights, sigmas
+
 
     def forward(
         self,
@@ -334,14 +326,15 @@ class GaussianSplatDecoder(BaseDecoder):
             The decoded image from the latents and pose.
         """
 
-        # decode the splats from the latents and pose
+        # Decode the splats from the latents and pose
         splats, weights, sigmas = self.decode_splats(z, pose)
 
+        # Apply the gaussian splat renderer
         x = self._splatter(
             splats, weights, sigmas, splat_sigma_range=self._splat_sigma_range
         )
 
-        # if we're doing a final convolution, do it here
+        # Apply final convolution if needed
         if self._output_channels is not None and use_final_convolution:
             x = self._decoder(x)
 

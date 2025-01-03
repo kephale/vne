@@ -9,6 +9,7 @@ import pickle
 from scipy.ndimage import gaussian_filter
 import random
 from collections import Counter
+from torch.utils.data import DistributedSampler
 
 class CopickDataset(Dataset):
     def __init__(
@@ -18,14 +19,18 @@ class CopickDataset(Dataset):
         augment: bool = False,
         cache_dir: str = "./dataset_cache",
         device: str = "cpu",
-        seed: Optional[int] = 1717
+        seed: Optional[int] = 1717,
+        rank: Optional[int] = None,
+        world_size: Optional[int] = None        
     ):
-        self.config_path = config_path  # Store the path instead of loading copick immediately
+        self.config_path = config_path
         self.boxsize = boxsize
         self.augment = augment
         self.cache_dir = cache_dir
-        self.device = 'cpu'  # Always keep data on CPU initially
+        self.device = 'cpu'
         self.seed = seed
+        self.rank = rank
+        self.world_size = world_size
         self._set_random_seed()
         self._subvolumes = []
         self._molecule_ids = []
@@ -48,28 +53,46 @@ class CopickDataset(Dataset):
             np.random.seed(self.seed)
 
     def _load_or_process_data(self):
-        cache_file = os.path.join(self.cache_dir, f"copick_cache_{self.boxsize[0]}x{self.boxsize[1]}x{self.boxsize[2]}.pkl")
+        cache_file = os.path.join(
+            self.cache_dir, 
+            f"copick_cache_{self.boxsize[0]}x{self.boxsize[1]}x{self.boxsize[2]}.pkl"
+        )
         
-        if os.path.exists(cache_file):
-            print(f"Loading cached data from {cache_file}")
-            with open(cache_file, 'rb') as f:
-                cached_data = pickle.load(f)
-                self._subvolumes = cached_data['subvolumes']
-                self._molecule_ids = cached_data['molecule_ids']
-                self._keys = cached_data['keys']
-        else:
-            print("Processing data and creating cache...")
-            self._load_data()
+        # Only rank 0 process should create the cache
+        if self.rank is None or self.rank == 0:
+            if not os.path.exists(cache_file):
+                print("Processing data and creating cache...")
+                self._load_data()
+                os.makedirs(self.cache_dir, exist_ok=True)
+                with open(cache_file, 'wb') as f:
+                    pickle.dump({
+                        'subvolumes': self._subvolumes,
+                        'molecule_ids': self._molecule_ids,
+                        'keys': self._keys
+                    }, f)
+                print(f"Cached data saved to {cache_file}")
+        
+        # Wait for rank 0 to finish creating cache if needed
+        if self.world_size is not None:
+            torch.distributed.barrier()
+        
+        print(f"Loading cached data from {cache_file}")
+        with open(cache_file, 'rb') as f:
+            cached_data = pickle.load(f)
+            self._subvolumes = cached_data['subvolumes']
+            self._molecule_ids = cached_data['molecule_ids']
+            self._keys = cached_data['keys']
+
+        # If using distributed training, partition the dataset
+        if self.rank is not None and self.world_size is not None:
+            total_size = len(self._subvolumes)
+            indices = list(range(total_size))
+            split_size = total_size // self.world_size
+            start_idx = self.rank * split_size
+            end_idx = start_idx + split_size if self.rank != self.world_size - 1 else total_size
             
-            os.makedirs(self.cache_dir, exist_ok=True)
-            
-            with open(cache_file, 'wb') as f:
-                pickle.dump({
-                    'subvolumes': self._subvolumes,
-                    'molecule_ids': self._molecule_ids,
-                    'keys': self._keys
-                }, f)
-            print(f"Cached data saved to {cache_file}")
+            self._subvolumes = self._subvolumes[start_idx:end_idx]
+            self._molecule_ids = self._molecule_ids[start_idx:end_idx]
 
     def _load_data(self):
         # Load copick root only when needed
