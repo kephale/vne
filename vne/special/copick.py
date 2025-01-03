@@ -20,26 +20,18 @@ class CopickDataset(Dataset):
         device: str = "cpu",
         seed: Optional[int] = 1717
     ):
-        self.root = copick.from_file(config_path)
+        self.config_path = config_path  # Store the path instead of loading copick immediately
         self.boxsize = boxsize
         self.augment = augment
         self.cache_dir = cache_dir
-        self.device = device 
-        
+        self.device = 'cpu'  # Always keep data on CPU initially
         self.seed = seed
         self._set_random_seed()
-
         self._subvolumes = []
         self._molecule_ids = []
         self._keys = []
-        self.difficulty_scores = None
-        
         self._load_or_process_data()
-
-        if len(self._subvolumes) == 0:
-            raise ValueError("No valid subvolumes found in the dataset. Please check your Copick configuration and ensure there are valid picks and tomograms.")
-
-        self._compute_sample_weights()        
+        self._compute_sample_weights()
 
     def _compute_sample_weights(self):
         """
@@ -47,13 +39,8 @@ class CopickDataset(Dataset):
         """
         class_counts = Counter(self._molecule_ids)
         total_samples = len(self._molecule_ids)
-
-        # Calculate weight for each class
         class_weights = {cls: total_samples / count for cls, count in class_counts.items()}
-
-        # Assign weights to each sample based on its class
         self.sample_weights = [class_weights[mol_id] for mol_id in self._molecule_ids]
-
 
     def _set_random_seed(self):
         if self.seed is not None:
@@ -74,10 +61,8 @@ class CopickDataset(Dataset):
             print("Processing data and creating cache...")
             self._load_data()
             
-            # Create cache directory if it doesn't exist
             os.makedirs(self.cache_dir, exist_ok=True)
             
-            # Save processed data to cache
             with open(cache_file, 'wb') as f:
                 pickle.dump({
                     'subvolumes': self._subvolumes,
@@ -87,12 +72,14 @@ class CopickDataset(Dataset):
             print(f"Cached data saved to {cache_file}")
 
     def _load_data(self):
+        # Load copick root only when needed
+        root = copick.from_file(self.config_path)
         voxel_spacing = 10  # TODO: Consider making this a parameter
-        for run in self.root.runs:
+        
+        for run in root.runs:
             print(f"Processing Run: {run}")
             try:
                 tomogram = run.get_voxel_spacing(voxel_spacing).tomograms[0]
-                # Load the entire tomogram array once
                 tomogram_array = tomogram.numpy()
                 print(f"Loaded tomogram with shape: {tomogram_array.shape}")
             except AttributeError:
@@ -106,7 +93,6 @@ class CopickDataset(Dataset):
                     points, _ = picks.numpy()
                     print(f"Processing {len(points)} points for {object_name}")
 
-                    # Adjust for voxel spacing
                     points = points / voxel_spacing
                     
                     for point in points:
@@ -125,6 +111,9 @@ class CopickDataset(Dataset):
         self._subvolumes = np.array(self._subvolumes)
         self._molecule_ids = np.array(self._molecule_ids)
         
+        # Clear the reference to root to avoid pickling issues
+        del root
+        
         print(f"Loaded {len(self._subvolumes)} subvolumes with {len(self._keys)} unique object types.")
 
     def _extract_subvolume(self, tomogram_array, x, y, z):
@@ -138,10 +127,7 @@ class CopickDataset(Dataset):
         except IndexError as e:
             raise ValueError(f"Error extracting subvolume: {str(e)}. Check if the point ({x}, {y}, {z}) is within the tomogram bounds.")
         
-        # Pad or crop to ensure consistent size
-        subvolume = self._pad_or_crop(subvolume)
-        
-        return subvolume
+        return self._pad_or_crop(subvolume)
 
     def _pad_or_crop(self, subvolume):
         current_shape = np.array(subvolume.shape)
@@ -154,12 +140,10 @@ class CopickDataset(Dataset):
         
         for dim in range(3):
             if current_shape[dim] < target_shape[dim]:
-                # Pad
                 pad_width = (target_shape[dim] - current_shape[dim]) // 2
                 start = pad_width
                 end = start + current_shape[dim]
             else:
-                # Crop
                 crop = (current_shape[dim] - target_shape[dim]) // 2
                 start = crop
                 end = start + target_shape[dim]
@@ -183,10 +167,10 @@ class CopickDataset(Dataset):
         if self.augment:
             subvolume = self._augment_subvolume(subvolume)
 
-        subvolume = (subvolume - np.mean(subvolume)) / (np.std(subvolume) + 1e-6)  # Add small epsilon to avoid division by zero
-        subvolume = torch.as_tensor(subvolume[None, ...], dtype=torch.float32).to(self.device)  # Move to specified device
-        return subvolume, torch.tensor(molecule_idx, device=self.device)  # Ensure the molecule index is also on the device
-
+        subvolume = (subvolume - np.mean(subvolume)) / (np.std(subvolume) + 1e-6)
+        subvolume = torch.as_tensor(subvolume[None, ...], dtype=torch.float32)
+        return subvolume, torch.tensor(molecule_idx)  # Return on CPU
+        
     def get_sample_weights(self):
         """
         Returns the computed sample weights for use in a WeightedRandomSampler.
@@ -231,6 +215,10 @@ class CopickDataset(Dataset):
 
     def keys(self) -> List[str]:
         return self._keys
+
+    def get_pickable_objects(self):
+        root = copick.from_file(self.config_path)
+        return root.pickable_objects
 
     def examples(self) -> Tuple[torch.Tensor, List[str]]:
         x_idx = set()
