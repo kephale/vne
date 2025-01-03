@@ -351,6 +351,7 @@ class TransformerGaussianDecoder(BaseDecoder):
         num_layers: int = 6,
         output_channels: Optional[int] = None,
         device: torch.device = torch.device("cpu"),
+        curriculum_schedule = None
     ):
         super().__init__()
         
@@ -360,6 +361,8 @@ class TransformerGaussianDecoder(BaseDecoder):
         self._output_channels = output_channels
         self._n_gaussians_range = n_gaussians_range
         self._d_model = d_model
+        self.curriculum_schedule = curriculum_schedule
+        self.current_epoch = 0
 
         # Sequence length predictor
         self.sequence_length = nn.Sequential(
@@ -443,16 +446,17 @@ class TransformerGaussianDecoder(BaseDecoder):
         """Decode latent vector into sequence of Gaussian parameters."""
         batch_size = z.shape[0]
         
-        # Predict sequence length - modify to ensure valid range
-        seq_len_ratio = self.sequence_length(z).squeeze(-1)  # Shape: [batch_size]
+        # Use curriculum-adjusted maximum sequence length
         min_len, max_len = self._n_gaussians_range
+        
+        # Predict sequence length - modify to ensure valid range
+        seq_len_ratio = self.sequence_length(z).squeeze(-1)
         
         # Calculate number of gaussians for each batch element
         n_gaussians = min_len + (max_len - min_len) * seq_len_ratio
-        n_gaussians = n_gaussians.round().long()  # Convert to integer
+        n_gaussians = n_gaussians.round().long()
         
-        # Use max_len for all sequences to avoid inconsistent sizes
-        # We'll mask unused positions later
+        # Use curriculum-adjusted max_len for all sequences
         query_embeddings = self.query_embed.weight[:max_len].unsqueeze(0).expand(batch_size, -1, -1)
         
         # Project latent vector
@@ -527,3 +531,10 @@ class TransformerGaussianDecoder(BaseDecoder):
             x = self.final_conv(x)
             
         return x
+
+    def update_epoch(self, epoch):
+        """Update the current epoch for curriculum learning."""
+        self.current_epoch = epoch
+        if self.curriculum_schedule:
+            max_gaussians = self.curriculum_schedule.get_max_gaussians(epoch)
+            self._n_gaussians_range = (self._n_gaussians_range[0], max_gaussians)        
