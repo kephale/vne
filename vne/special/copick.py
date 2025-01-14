@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import copick
 from pathlib import Path
 import os
@@ -22,199 +22,161 @@ class CopickDataset(Dataset):
         seed: Optional[int] = 1717,
         rank: Optional[int] = None,
         world_size: Optional[int] = None,
-        max_samples: Optional[int] = None
+        active_samples: int = 25000,
+        refresh_epochs: int = 10
     ):
         self.config_path = config_path
         self.boxsize = boxsize
         self.augment = augment
         self.cache_dir = cache_dir
-        self.device = 'cpu'
+        self.device = device
         self.seed = seed
         self.rank = rank
         self.world_size = world_size
-        self.max_samples = max_samples
+        self.active_samples = active_samples
+        self.refresh_epochs = refresh_epochs
+        self.current_epoch = 0
+        
         self._set_random_seed()
+        self._initialize_data_structures()
+        self._discover_all_points()
+        self._load_initial_samples()
+        
+    def _initialize_data_structures(self):
+        """Initialize empty data structures."""
         self._subvolumes = []
         self._molecule_ids = []
         self._keys = []
-        self._load_or_process_data()
-        self._compute_sample_weights()
-
-    def _compute_sample_weights(self):
-        """
-        Compute sample weights based on class frequency for balancing.
-        """
-        class_counts = Counter(self._molecule_ids)
-        total_samples = len(self._molecule_ids)
-        class_weights = {cls: total_samples / count for cls, count in class_counts.items()}
-        self.sample_weights = [class_weights[mol_id] for mol_id in self._molecule_ids]
-
+        self._all_points: Dict[str, List[Tuple[float, float, float]]] = {}
+        self._current_indices = None
+        
     def _set_random_seed(self):
         if self.seed is not None:
             random.seed(self.seed)
             np.random.seed(self.seed)
-
-    def _load_or_process_data(self):
-        # If cache_dir is None, process data directly without caching
-        if self.cache_dir is None:
-            print("Cache directory not specified. Processing data without caching...")
-            self._load_data()
-            return
             
-        # If cache_dir is specified, use caching logic
+    def _discover_all_points(self):
+        """Discover and store all available points without loading volumes."""
+        print("\n=== Starting point discovery process ===")
+        root = copick.from_file(self.config_path)
+        voxel_spacing = 10
+        
+        for run_idx, run in enumerate(root.runs):
+            try:
+                for pick_idx, picks in enumerate(run.picks):
+                    if not picks.from_tool:
+                        continue
+                        
+                    object_name = picks.pickable_object_name
+                    if object_name not in self._keys:
+                        self._keys.append(object_name)
+                        
+                    points, _ = picks.numpy()
+                    points = points / voxel_spacing
+                    
+                    if object_name not in self._all_points:
+                        self._all_points[object_name] = []
+                    self._all_points[object_name].extend(points)
+                    
+            except Exception as e:
+                print(f"Error processing run {run_idx}: {str(e)}")
+                continue
+                
+        print(f"\nDiscovered points for {len(self._keys)} unique objects")
+        for key in self._keys:
+            print(f"{key}: {len(self._all_points[key])} points")
+            
+    def _load_from_cache(self) -> bool:
+        """Try to load data from cache if available."""
+        if not self.cache_dir:
+            return False
+            
         cache_file = os.path.join(
-            self.cache_dir, 
+            self.cache_dir,
             f"copick_cache_{self.boxsize[0]}x{self.boxsize[1]}x{self.boxsize[2]}.pkl"
         )
-        
-        # Only rank 0 process should create the cache
-        if self.rank is None or self.rank == 0:
-            if not os.path.exists(cache_file):
-                print("Processing data and creating cache...")
-                self._load_data()
-                os.makedirs(self.cache_dir, exist_ok=True)
-                with open(cache_file, 'wb') as f:
-                    pickle.dump({
-                        'subvolumes': self._subvolumes,
-                        'molecule_ids': self._molecule_ids,
-                        'keys': self._keys
-                    }, f)
-                print(f"Cached data saved to {cache_file}")
-        
-        # Wait for rank 0 to finish creating cache if needed
-        if self.world_size is not None:
-            torch.distributed.barrier()
         
         if os.path.exists(cache_file):
             print(f"Loading cached data from {cache_file}")
             with open(cache_file, 'rb') as f:
                 cached_data = pickle.load(f)
-                
-                # Apply max_samples limit if specified
-                if self.max_samples is not None:
-                    # Randomly select max_samples
-                    total_samples = len(cached_data['subvolumes'])
-                    if total_samples > self.max_samples:
-                        indices = np.random.choice(
-                            total_samples, 
-                            self.max_samples, 
-                            replace=False
-                        )
-                        self._subvolumes = np.array(cached_data['subvolumes'])[indices]
-                        self._molecule_ids = np.array(cached_data['molecule_ids'])[indices]
-                        self._keys = cached_data['keys']
-                        print(f"Randomly selected {self.max_samples} samples from {total_samples} total samples")
-                else:
-                    self._subvolumes = cached_data['subvolumes']
-                    self._molecule_ids = cached_data['molecule_ids']
-                    self._keys = cached_data['keys']
-
-        # If using distributed training, partition the dataset
-        if self.rank is not None and self.world_size is not None:
-            total_size = len(self._subvolumes)
-            indices = list(range(total_size))
-            split_size = total_size // self.world_size
-            start_idx = self.rank * split_size
-            end_idx = start_idx + split_size if self.rank != self.world_size - 1 else total_size
-            
-            self._subvolumes = self._subvolumes[start_idx:end_idx]
-            self._molecule_ids = self._molecule_ids[start_idx:end_idx]
-
-
-    def _load_data(self):
-        print("\n=== Starting data loading process ===")
-        print(f"Config path: {self.config_path}")
+                self._all_points = cached_data['all_points']
+                self._keys = cached_data['keys']
+            return True
+        return False
         
-        # Load copick root with detailed error handling
-        try:
-            root = copick.from_file(self.config_path)
-            print(f"Successfully loaded copick root")
-            print(f"Number of runs found: {len(root.runs)}")
-        except Exception as e:
-            print(f"Failed to load copick root: {str(e)}")
+    def _save_to_cache(self):
+        """Save discovered points to cache."""
+        if not self.cache_dir:
             return
-
-        voxel_spacing = 10
-        
-        for run_idx, run in enumerate(root.runs):
-            print(f"\n--- Processing Run {run_idx}: {run.name} ---")
             
-            # Try to load tomogram with detailed error handling
-            try:
-                tomogram = run.get_voxel_spacing(voxel_spacing).tomograms[0]
-                tomogram_array = tomogram.numpy()
-                print(f"Successfully loaded tomogram with shape: {tomogram_array.shape}")
-            except IndexError:
-                print(f"No tomograms found in run {run.name}")
-                continue
-            except AttributeError as e:
-                print(f"Error accessing tomogram attributes: {str(e)}")
-                continue
-            except Exception as e:
-                print(f"Unexpected error loading tomogram: {str(e)}")
-                continue
-
-            # Process picks with detailed logging
-            print(f"Number of pick sets: {len(run.picks)}")
-            for pick_idx, picks in enumerate(run.picks):
-                print(f"\nProcessing pick set {pick_idx}")
-                print(f"From tool: {picks.from_tool}")
-                if not picks.from_tool:
-                    print("Skipping non-tool picks")
-                    continue
-                    
-                object_name = picks.pickable_object_name
-                print(f"Object name: {object_name}")
-                
-                try:
-                    points, _ = picks.numpy()
-                    print(f"Found {len(points)} points")
-                    
-                    points = points / voxel_spacing
-                    successful_extractions = 0
-                    
-                    for point_idx, point in enumerate(points):
-                        try:
-                            x, y, z = point
-                            subvolume = self._extract_subvolume(tomogram_array, x, y, z)
-                            self._subvolumes.append(subvolume)
-                            
-                            if object_name not in self._keys:
-                                self._keys.append(object_name)
-                            
-                            self._molecule_ids.append(self._keys.index(object_name))
-                            successful_extractions += 1
-                            
-                            if point_idx % 100 == 0:  # Log progress every 100 points
-                                print(f"Processed {point_idx + 1}/{len(points)} points")
-                                
-                        except ValueError as e:
-                            print(f"Failed to extract subvolume for point {point}: {str(e)}")
-                    
-                    print(f"Successfully extracted {successful_extractions}/{len(points)} subvolumes")
-                    
-                except Exception as e:
-                    print(f"Error processing picks: {str(e)}")
-                    continue
+        cache_file = os.path.join(
+            self.cache_dir,
+            f"copick_cache_{self.boxsize[0]}x{self.boxsize[1]}x{self.boxsize[2]}.pkl"
+        )
         
+        os.makedirs(self.cache_dir, exist_ok=True)
+        with open(cache_file, 'wb') as f:
+            pickle.dump({
+                'all_points': self._all_points,
+                'keys': self._keys
+            }, f)
+        print(f"Saved point data to cache: {cache_file}")
+        
+    def _load_initial_samples(self):
+        """Load initial batch of samples."""
+        if self._load_from_cache():
+            self._refresh_active_samples()
+        else:
+            self._refresh_active_samples()
+            self._save_to_cache()
+            
+    def _refresh_active_samples(self):
+        """Refresh the currently active samples."""
+        print("\n=== Refreshing active samples ===")
+        
+        # Clear current data
+        self._subvolumes = []
+        self._molecule_ids = []
+        
+        # Calculate samples per class
+        num_classes = len(self._keys)
+        samples_per_class = self.active_samples // num_classes
+        remaining_samples = self.active_samples % num_classes
+        
+        root = copick.from_file(self.config_path)
+        voxel_spacing = 10
+        tomogram = root.runs[0].get_voxel_spacing(voxel_spacing).tomograms[0]
+        tomogram_array = tomogram.numpy()
+        
+        for class_idx, object_name in enumerate(self._keys):
+            points = self._all_points[object_name]
+            
+            # Calculate number of samples for this class
+            class_samples = samples_per_class + (1 if class_idx < remaining_samples else 0)
+            
+            # Randomly select points if we have more than needed
+            if len(points) > class_samples:
+                selected_points = random.sample(points, class_samples)
+            else:
+                selected_points = points
+                
+            # Load volumes for selected points
+            for point in selected_points:
+                try:
+                    subvolume = self._extract_subvolume(tomogram_array, *point)
+                    self._subvolumes.append(subvolume)
+                    self._molecule_ids.append(self._keys.index(object_name))
+                except ValueError as e:
+                    print(f"Failed to extract subvolume for point {point}: {str(e)}")
+                    
         self._subvolumes = np.array(self._subvolumes)
         self._molecule_ids = np.array(self._molecule_ids)
-
-        # TODO check that random seeds are handled properly
-        if self.max_samples is not None and len(self._subvolumes) > self.max_samples:
-            indices = np.random.choice(len(self._subvolumes), self.max_samples, replace=False)
-            self._subvolumes = np.array(self._subvolumes)[indices]
-            self._molecule_ids = np.array(self._molecule_ids)[indices]
         
-        print("\n=== Data loading summary ===")
-        print(f"Total subvolumes loaded: {len(self._subvolumes)}")
-        print(f"Unique object types: {len(self._keys)}")
-        print(f"Object types: {self._keys}")
+        print(f"Loaded {len(self._subvolumes)} active samples")
         
-        # Clear the reference to root to avoid pickling issues
-        del root
-
     def _extract_subvolume(self, tomogram_array, x, y, z):
+        """Extract a subvolume from the tomogram."""
         half_box = np.array(self.boxsize) // 2
         x_slice = slice(int(x - half_box[0]), int(x + half_box[0]))
         y_slice = slice(int(y - half_box[1]), int(y + half_box[1]))
@@ -223,11 +185,12 @@ class CopickDataset(Dataset):
         try:
             subvolume = tomogram_array[z_slice, y_slice, x_slice]
         except IndexError as e:
-            raise ValueError(f"Error extracting subvolume: {str(e)}. Check if the point ({x}, {y}, {z}) is within the tomogram bounds.")
+            raise ValueError(f"Error extracting subvolume: {str(e)}")
         
         return self._pad_or_crop(subvolume)
-
+        
     def _pad_or_crop(self, subvolume):
+        """Ensure subvolume matches target size through padding or cropping."""
         current_shape = np.array(subvolume.shape)
         target_shape = np.array(self.boxsize)
         
@@ -254,28 +217,29 @@ class CopickDataset(Dataset):
                 result[:, :, :] = subvolume[:, :, start:end]
         
         return result
-
+        
+    def update_epoch(self, epoch: int):
+        """Update the current epoch and refresh samples if needed."""
+        self.current_epoch = epoch
+        if epoch % self.refresh_epochs == 0:
+            self._refresh_active_samples()
+            
     def __len__(self):
         return len(self._subvolumes)
-
+        
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         subvolume = self._subvolumes[idx]
         molecule_idx = self._molecule_ids[idx]
-
+        
         if self.augment:
             subvolume = self._augment_subvolume(subvolume)
-
+            
         subvolume = (subvolume - np.mean(subvolume)) / (np.std(subvolume) + 1e-6)
         subvolume = torch.as_tensor(subvolume[None, ...], dtype=torch.float32)
-        return subvolume, torch.tensor(molecule_idx)  # Return on CPU
+        return subvolume, torch.tensor(molecule_idx)
         
-    def get_sample_weights(self):
-        """
-        Returns the computed sample weights for use in a WeightedRandomSampler.
-        """
-        return self.sample_weights
-
     def _augment_subvolume(self, subvolume):
+        """Apply data augmentation to a subvolume."""
         if random.random() < 0.5:
             subvolume = self._brightness(subvolume)
         if random.random() < 0.5:
