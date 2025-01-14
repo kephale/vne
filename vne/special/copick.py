@@ -10,6 +10,8 @@ from scipy.ndimage import gaussian_filter
 import random
 from collections import Counter
 from torch.utils.data import DistributedSampler
+import threading
+from queue import Queue
 
 class CopickDataset(Dataset):
     def __init__(
@@ -38,7 +40,14 @@ class CopickDataset(Dataset):
         self.refresh_epochs = refresh_epochs
         self.val_split = val_split
         self.current_epoch = 0
-        self.is_val = False  # Flag to indicate if this is a validation dataset
+        self.is_val = False
+        
+        # Double buffering structures
+        self._current_buffer = {'subvolumes': None, 'molecule_ids': None}
+        self._next_buffer = {'subvolumes': None, 'molecule_ids': None}
+        self._buffer_lock = threading.Lock()
+        self._loading_thread = None
+        self._loading_complete = threading.Event()
         
         self._set_random_seed()
         self._initialize_data_structures()
@@ -51,24 +60,24 @@ class CopickDataset(Dataset):
             raise ValueError("val_split must be between 0 and 1")
             
         # Create train dataset through inheritance
-        class TrainDataset(CopickDataset):
+        class TrainDataset(DoubleCopickDataset):
             def __init__(self, parent):
                 self.__dict__.update(parent.__dict__)  # Share all attributes
                 self.active_samples = int(parent.active_samples * (1 - parent.val_split))
                 self.augment = parent.augment
                 self.is_val = False
-                self._set_random_seed()  # Reset seed for training
-                self._refresh_active_samples()  # Only load samples, skip discovery
+                self._set_random_seed()
+                self._refresh_active_samples()
                 
         # Create validation dataset through inheritance
-        class ValDataset(CopickDataset):
+        class ValDataset(DoubleCopickDataset):
             def __init__(self, parent):
                 self.__dict__.update(parent.__dict__)  # Share all attributes
                 self.active_samples = int(parent.active_samples * parent.val_split)
                 self.augment = False  # No augmentation for validation
                 self.is_val = True
-                self._set_random_seed()  # Different seed for validation
-                self._refresh_active_samples()  # Only load samples, skip discovery
+                self._set_random_seed()
+                self._refresh_active_samples()
                 
         train_dataset = TrainDataset(self)
         val_dataset = ValDataset(self)
@@ -77,10 +86,131 @@ class CopickDataset(Dataset):
 
     def _initialize_data_structures(self):
         """Initialize empty data structures."""
-        self._subvolumes = []
-        self._molecule_ids = []
-        self._keys = []
         self._all_points: Dict[str, List[Tuple[float, float, float]]] = {}
+        self._keys = []
+
+    def _load_samples_async(self):
+        """Asynchronously load the next batch of samples."""
+        subvolumes = []
+        molecule_ids = []
+        
+        # Calculate samples per class
+        num_classes = len(self._keys)
+        samples_per_class = self.active_samples // num_classes
+        remaining_samples = self.active_samples % num_classes
+        
+        root = copick.from_file(self.config_path)
+        voxel_spacing = 10
+        tomogram = root.runs[0].get_voxel_spacing(voxel_spacing).tomograms[0]
+        tomogram_array = tomogram.numpy()
+        
+        for class_idx, object_name in enumerate(self._keys):
+            points = self._all_points[object_name]
+            class_samples = samples_per_class + (1 if class_idx < remaining_samples else 0)
+            
+            if len(points) > class_samples:
+                selected_points = random.sample(points, class_samples)
+            else:
+                selected_points = points
+                
+            for point in selected_points:
+                try:
+                    subvolume = self._extract_subvolume(tomogram_array, *point)
+                    subvolumes.append(subvolume)
+                    molecule_ids.append(self._keys.index(object_name))
+                except ValueError as e:
+                    print(f"Failed to extract subvolume for point {point}: {str(e)}")
+        
+        with self._buffer_lock:
+            self._next_buffer['subvolumes'] = np.array(subvolumes)
+            self._next_buffer['molecule_ids'] = np.array(molecule_ids)
+            self._loading_complete.set()
+
+    def update_epoch(self, epoch: int):
+        """Update the current epoch and trigger sample refresh if needed."""
+        self.current_epoch = epoch
+        
+        if not self.is_val and epoch % self.refresh_epochs == 0:
+            # Wait for any ongoing loading to complete
+            if self._loading_thread is not None:
+                self._loading_thread.join()
+            
+            # Swap buffers
+            with self._buffer_lock:
+                if self._next_buffer['subvolumes'] is not None:
+                    self._current_buffer = self._next_buffer
+                    self._next_buffer = {'subvolumes': None, 'molecule_ids': None}
+                    self._loading_complete.clear()
+            
+            # Start loading next buffer
+            self._loading_thread = threading.Thread(target=self._load_samples_async)
+            self._loading_thread.start()
+
+    def _load_initial_samples(self):
+        """Load initial batch of samples."""
+        if self._load_from_cache():
+            self._refresh_active_samples()
+        else:
+            self._refresh_active_samples()
+            if not self.is_val:
+                self._save_to_cache()
+        
+        # Start loading next buffer
+        self._loading_thread = threading.Thread(target=self._load_samples_async)
+        self._loading_thread.start()
+
+    def _refresh_active_samples(self):
+        """Refresh the currently active samples."""
+        print(f"\n=== Refreshing active samples for {'validation' if self.is_val else 'training'} ===")
+        
+        subvolumes = []
+        molecule_ids = []
+        
+        # Calculate samples per class
+        num_classes = len(self._keys)
+        samples_per_class = self.active_samples // num_classes
+        remaining_samples = self.active_samples % num_classes
+        
+        root = copick.from_file(self.config_path)
+        voxel_spacing = 10
+        tomogram = root.runs[0].get_voxel_spacing(voxel_spacing).tomograms[0]
+        tomogram_array = tomogram.numpy()
+        
+        for class_idx, object_name in enumerate(self._keys):
+            points = self._all_points[object_name]
+            class_samples = samples_per_class + (1 if class_idx < remaining_samples else 0)
+            
+            if len(points) > class_samples:
+                selected_points = random.sample(points, class_samples)
+            else:
+                selected_points = points
+                
+            for point in selected_points:
+                try:
+                    subvolume = self._extract_subvolume(tomogram_array, *point)
+                    subvolumes.append(subvolume)
+                    molecule_ids.append(self._keys.index(object_name))
+                except ValueError as e:
+                    print(f"Failed to extract subvolume for point {point}: {str(e)}")
+        
+        self._current_buffer['subvolumes'] = np.array(subvolumes)
+        self._current_buffer['molecule_ids'] = np.array(molecule_ids)
+        
+        print(f"Loaded {len(subvolumes)} active samples")
+
+    def __len__(self):
+        return len(self._current_buffer['subvolumes']) if self._current_buffer['subvolumes'] is not None else 0
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        subvolume = self._current_buffer['subvolumes'][idx]
+        molecule_idx = self._current_buffer['molecule_ids'][idx]
+        
+        if self.augment and not self.is_val:
+            subvolume = self._augment_subvolume(subvolume)
+            
+        subvolume = (subvolume - np.mean(subvolume)) / (np.std(subvolume) + 1e-6)
+        subvolume = torch.as_tensor(subvolume[None, ...], dtype=torch.float32)
+        return subvolume, torch.tensor(molecule_idx)
         
     def _set_random_seed(self):
         if self.seed is not None:
@@ -156,59 +286,6 @@ class CopickDataset(Dataset):
             }, f)
         print(f"Saved point data to cache: {cache_file}")
         
-    def _load_initial_samples(self):
-        """Load initial batch of samples."""
-        if self._load_from_cache():
-            self._refresh_active_samples()
-        else:
-            self._refresh_active_samples()
-            if not self.is_val:  # Only save cache from training dataset
-                self._save_to_cache()
-            
-    def _refresh_active_samples(self):
-        """Refresh the currently active samples."""
-        print(f"\n=== Refreshing active samples for {'validation' if self.is_val else 'training'} ===")
-        
-        # Clear current data
-        self._subvolumes = []
-        self._molecule_ids = []
-        
-        # Calculate samples per class
-        num_classes = len(self._keys)
-        samples_per_class = self.active_samples // num_classes
-        remaining_samples = self.active_samples % num_classes
-        
-        root = copick.from_file(self.config_path)
-        voxel_spacing = 10
-        tomogram = root.runs[0].get_voxel_spacing(voxel_spacing).tomograms[0]
-        tomogram_array = tomogram.numpy()
-        
-        for class_idx, object_name in enumerate(self._keys):
-            points = self._all_points[object_name]
-            
-            # Calculate number of samples for this class
-            class_samples = samples_per_class + (1 if class_idx < remaining_samples else 0)
-            
-            # Randomly select points if we have more than needed
-            if len(points) > class_samples:
-                selected_points = random.sample(points, class_samples)
-            else:
-                selected_points = points
-                
-            # Load volumes for selected points
-            for point in selected_points:
-                try:
-                    subvolume = self._extract_subvolume(tomogram_array, *point)
-                    self._subvolumes.append(subvolume)
-                    self._molecule_ids.append(self._keys.index(object_name))
-                except ValueError as e:
-                    print(f"Failed to extract subvolume for point {point}: {str(e)}")
-                    
-        self._subvolumes = np.array(self._subvolumes)
-        self._molecule_ids = np.array(self._molecule_ids)
-        
-        print(f"Loaded {len(self._subvolumes)} active samples")
-        
     def _extract_subvolume(self, tomogram_array, x, y, z):
         """Extract a subvolume from the tomogram."""
         half_box = np.array(self.boxsize) // 2
@@ -251,26 +328,6 @@ class CopickDataset(Dataset):
                 result[:, :, :] = subvolume[:, :, start:end]
         
         return result
-        
-    def update_epoch(self, epoch: int):
-        """Update the current epoch and refresh samples if needed."""
-        self.current_epoch = epoch
-        if not self.is_val and epoch % self.refresh_epochs == 0:  # Only refresh training data
-            self._refresh_active_samples()
-            
-    def __len__(self):
-        return len(self._subvolumes)
-        
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        subvolume = self._subvolumes[idx]
-        molecule_idx = self._molecule_ids[idx]
-        
-        if self.augment and not self.is_val:  # Only augment training data
-            subvolume = self._augment_subvolume(subvolume)
-            
-        subvolume = (subvolume - np.mean(subvolume)) / (np.std(subvolume) + 1e-6)
-        subvolume = torch.as_tensor(subvolume[None, ...], dtype=torch.float32)
-        return subvolume, torch.tensor(molecule_idx)
         
     def _augment_subvolume(self, subvolume):
         """Apply data augmentation to a subvolume."""
