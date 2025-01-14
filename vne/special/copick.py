@@ -60,7 +60,7 @@ class CopickDataset(Dataset):
             raise ValueError("val_split must be between 0 and 1")
             
         # Create train dataset through inheritance
-        class TrainDataset(DoubleCopickDataset):
+        class TrainDataset(CopickDataset):
             def __init__(self, parent):
                 self.__dict__.update(parent.__dict__)  # Share all attributes
                 self.active_samples = int(parent.active_samples * (1 - parent.val_split))
@@ -70,7 +70,7 @@ class CopickDataset(Dataset):
                 self._refresh_active_samples()
                 
         # Create validation dataset through inheritance
-        class ValDataset(DoubleCopickDataset):
+        class ValDataset(CopickDataset):
             def __init__(self, parent):
                 self.__dict__.update(parent.__dict__)  # Share all attributes
                 self.active_samples = int(parent.active_samples * parent.val_split)
