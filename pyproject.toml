@@ -28,6 +28,8 @@ dependencies = [
   "pytorch-lightning",
   "mlflow",
   "uvicorn",
+  "connected-components-3d>=3.22.0",
+  "mrcfile>=1.5.3",
 ]
 
 [project.optional-dependencies]
