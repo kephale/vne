@@ -23,7 +23,8 @@ class CopickDataset(Dataset):
         rank: Optional[int] = None,
         world_size: Optional[int] = None,
         active_samples: int = 25000,
-        refresh_epochs: int = 10
+        refresh_epochs: int = 10,
+        val_split: float = 0.01
     ):
         self.config_path = config_path
         self.boxsize = boxsize
@@ -35,56 +36,88 @@ class CopickDataset(Dataset):
         self.world_size = world_size
         self.active_samples = active_samples
         self.refresh_epochs = refresh_epochs
+        self.val_split = val_split
         self.current_epoch = 0
+        self.is_val = False  # Flag to indicate if this is a validation dataset
         
         self._set_random_seed()
         self._initialize_data_structures()
         self._discover_all_points()
         self._load_initial_samples()
         
+    def create_train_val_splits(self):
+        """Create train and validation datasets efficiently by sharing discovered data."""
+        if self.val_split <= 0 or self.val_split >= 1:
+            raise ValueError("val_split must be between 0 and 1")
+            
+        # Create train dataset through inheritance
+        class TrainDataset(CopickDataset):
+            def __init__(self, parent):
+                self.__dict__.update(parent.__dict__)  # Share all attributes
+                self.active_samples = int(parent.active_samples * (1 - parent.val_split))
+                self.augment = parent.augment
+                self.is_val = False
+                self._set_random_seed()  # Reset seed for training
+                self._refresh_active_samples()  # Only load samples, skip discovery
+                
+        # Create validation dataset through inheritance
+        class ValDataset(CopickDataset):
+            def __init__(self, parent):
+                self.__dict__.update(parent.__dict__)  # Share all attributes
+                self.active_samples = int(parent.active_samples * parent.val_split)
+                self.augment = False  # No augmentation for validation
+                self.is_val = True
+                self._set_random_seed()  # Different seed for validation
+                self._refresh_active_samples()  # Only load samples, skip discovery
+                
+        train_dataset = TrainDataset(self)
+        val_dataset = ValDataset(self)
+        
+        return train_dataset, val_dataset
+
     def _initialize_data_structures(self):
         """Initialize empty data structures."""
         self._subvolumes = []
         self._molecule_ids = []
         self._keys = []
         self._all_points: Dict[str, List[Tuple[float, float, float]]] = {}
-        self._current_indices = None
         
     def _set_random_seed(self):
         if self.seed is not None:
-            random.seed(self.seed)
-            np.random.seed(self.seed)
+            random.seed(self.seed + (0 if not self.is_val else 1700))
+            np.random.seed(self.seed + (0 if not self.is_val else 1700))
             
     def _discover_all_points(self):
         """Discover and store all available points without loading volumes."""
-        print("\n=== Starting point discovery process ===")
-        root = copick.from_file(self.config_path)
-        voxel_spacing = 10
-        
-        for run_idx, run in enumerate(root.runs):
-            try:
-                for pick_idx, picks in enumerate(run.picks):
-                    if not picks.from_tool:
-                        continue
+        if not self._all_points:  # Only discover if not already loaded
+            print("\n=== Starting point discovery process ===")
+            root = copick.from_file(self.config_path)
+            voxel_spacing = 10
+            
+            for run_idx, run in enumerate(root.runs):
+                try:
+                    for pick_idx, picks in enumerate(run.picks):
+                        if not picks.from_tool:
+                            continue
+                            
+                        object_name = picks.pickable_object_name
+                        if object_name not in self._keys:
+                            self._keys.append(object_name)
+                            
+                        points, _ = picks.numpy()
+                        points = points / voxel_spacing
                         
-                    object_name = picks.pickable_object_name
-                    if object_name not in self._keys:
-                        self._keys.append(object_name)
+                        if object_name not in self._all_points:
+                            self._all_points[object_name] = []
+                        self._all_points[object_name].extend(points)
                         
-                    points, _ = picks.numpy()
-                    points = points / voxel_spacing
+                except Exception as e:
+                    print(f"Error processing run {run_idx}: {str(e)}")
+                    continue
                     
-                    if object_name not in self._all_points:
-                        self._all_points[object_name] = []
-                    self._all_points[object_name].extend(points)
-                    
-            except Exception as e:
-                print(f"Error processing run {run_idx}: {str(e)}")
-                continue
-                
-        print(f"\nDiscovered points for {len(self._keys)} unique objects")
-        for key in self._keys:
-            print(f"{key}: {len(self._all_points[key])} points")
+            print(f"\nDiscovered points for {len(self._keys)} unique objects")
+            for key in self._keys:
+                print(f"{key}: {len(self._all_points[key])} points")
             
     def _load_from_cache(self) -> bool:
         """Try to load data from cache if available."""
@@ -129,11 +162,12 @@ class CopickDataset(Dataset):
             self._refresh_active_samples()
         else:
             self._refresh_active_samples()
-            self._save_to_cache()
+            if not self.is_val:  # Only save cache from training dataset
+                self._save_to_cache()
             
     def _refresh_active_samples(self):
         """Refresh the currently active samples."""
-        print("\n=== Refreshing active samples ===")
+        print(f"\n=== Refreshing active samples for {'validation' if self.is_val else 'training'} ===")
         
         # Clear current data
         self._subvolumes = []
@@ -221,7 +255,7 @@ class CopickDataset(Dataset):
     def update_epoch(self, epoch: int):
         """Update the current epoch and refresh samples if needed."""
         self.current_epoch = epoch
-        if epoch % self.refresh_epochs == 0:
+        if not self.is_val and epoch % self.refresh_epochs == 0:  # Only refresh training data
             self._refresh_active_samples()
             
     def __len__(self):
@@ -231,7 +265,7 @@ class CopickDataset(Dataset):
         subvolume = self._subvolumes[idx]
         molecule_idx = self._molecule_ids[idx]
         
-        if self.augment:
+        if self.augment and not self.is_val:  # Only augment training data
             subvolume = self._augment_subvolume(subvolume)
             
         subvolume = (subvolume - np.mean(subvolume)) / (np.std(subvolume) + 1e-6)
