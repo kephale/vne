@@ -26,7 +26,8 @@ class CopickDataset(Dataset):
         world_size: Optional[int] = None,
         active_samples: int = 25000,
         refresh_epochs: int = 10,
-        val_split: float = 0.01
+        val_split: float = 0.01,
+        voxel_spacing: float = 5
     ):
         self.config_path = config_path
         self.boxsize = boxsize
@@ -41,6 +42,7 @@ class CopickDataset(Dataset):
         self.val_split = val_split
         self.current_epoch = 0
         self.is_val = False
+        self.voxel_spacing = voxel_spacing
         
         # Double buffering structures
         self._current_buffer = {'subvolumes': None, 'molecule_ids': None}
@@ -172,8 +174,7 @@ class CopickDataset(Dataset):
         remaining_samples = self.active_samples % num_classes
         
         root = copick.from_file(self.config_path)
-        voxel_spacing = 10
-        tomogram = root.runs[0].get_voxel_spacing(voxel_spacing).tomograms[0]
+        tomogram = root.runs[0].get_voxel_spacing(self.voxel_spacing).tomograms[0]
         tomogram_array = tomogram.numpy()
         
         for class_idx, object_name in enumerate(self._keys):
