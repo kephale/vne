@@ -351,7 +351,8 @@ class TransformerGaussianDecoder(BaseDecoder):
         num_layers: int = 6,
         output_channels: Optional[int] = None,
         device: torch.device = torch.device("cpu"),
-        curriculum_schedule = None
+        curriculum_schedule = None,
+        splat_sigma_range: Tuple[float, float] = (0.00025, 0.2)  # Add sigma range parameter
     ):
         super().__init__()
         
@@ -363,6 +364,7 @@ class TransformerGaussianDecoder(BaseDecoder):
         self._d_model = d_model
         self.curriculum_schedule = curriculum_schedule
         self.current_epoch = 0
+        self.splat_sigma_range = splat_sigma_range 
 
         # Sequence length predictor
         self.sequence_length = nn.Sequential(
@@ -407,49 +409,47 @@ class TransformerGaussianDecoder(BaseDecoder):
             )
 
     def _generate_gaussian_grid(self, positions, amplitudes, sigmas):
-        """Generate grid of Gaussian values using chunked processing."""
+        """Generate grid of Gaussian values using accumulation approach."""
         device = positions.device
         batch_size = positions.shape[0]
-
-        # Create coordinate grid
-        coords = [torch.linspace(-1, 1, s, device=device) for s in self._shape]
-        grid_points = torch.meshgrid(*coords, indexing='ij')
-        grid_coords = torch.stack([g.reshape(-1) for g in grid_points], dim=-1)
         
-        # Reshape positions and parameters for broadcasting
+        # Initialize the output grid directly in final shape
+        result = torch.zeros(batch_size, 1, *self._shape, device=device)
+        
+        # Create coordinate grid for each axis separately
+        coords = [torch.linspace(-1, 1, s, device=device) for s in self._shape]
+        
+        # Reshape parameters
         positions = positions.view(batch_size, -1, positions.shape[-1])  # [batch, N, 3]
         sigmas = sigmas.view(batch_size, -1, sigmas.shape[-1])  # [batch, N, 3]
         amplitudes = amplitudes.view(batch_size, -1)  # [batch, N]
         
-        # Process in chunks to reduce memory usage
-        chunk_size = 100000  # Adjust this based on available memory
-        n_points = grid_coords.shape[0]
-        n_chunks = (n_points + chunk_size - 1) // chunk_size
-        
-        # Initialize output tensor
-        result = torch.zeros(batch_size, n_points, device=device)
-        
-        for i in range(n_chunks):
-            start_idx = i * chunk_size
-            end_idx = min((i + 1) * chunk_size, n_points)
+        # Process each gaussian separately and accumulate
+        for i in range(positions.shape[1]):  # For each splat
+            # Get current gaussian parameters
+            pos = positions[:, i, :]  # [batch, 3]
+            sig = sigmas[:, i, :]     # [batch, 3]
+            amp = amplitudes[:, i]     # [batch]
             
-            # Process chunk of grid coordinates
-            grid_chunk = grid_coords[start_idx:end_idx].unsqueeze(0).unsqueeze(2)  # [1, chunk_size, 1, 3]
+            # Calculate gaussian values along each dimension separately
+            gaussian_components = []
+            for dim in range(3):
+                diff = (coords[dim].view(1, -1) - pos[:, dim].view(-1, 1)) / (sig[:, dim].view(-1, 1) + 1e-6)
+                gaussian_1d = torch.exp(-0.5 * diff * diff)  # [batch, dim_size]
+                gaussian_components.append(gaussian_1d)
             
-            # Calculate squared distances for chunk
-            diff = (grid_chunk - positions.unsqueeze(1)) / (sigmas.unsqueeze(1) + 1e-6)
-            dist_sq = torch.sum(diff * diff, dim=-1)
+            # Compute outer product to get 3D gaussian
+            # First dimension
+            temp = gaussian_components[0].unsqueeze(2).unsqueeze(3)  # [batch, x, 1, 1]
+            # Second dimension
+            temp = temp * gaussian_components[1].unsqueeze(1).unsqueeze(3)  # [batch, x, y, 1]
+            # Third dimension
+            temp = temp * gaussian_components[2].unsqueeze(1).unsqueeze(2)  # [batch, x, y, z]
             
-            # Calculate Gaussian values for chunk
-            gaussians = amplitudes.unsqueeze(1) * torch.exp(-0.5 * dist_sq)
-            
-            # Sum over Gaussians for this chunk
-            result[:, start_idx:end_idx] = torch.sum(gaussians, dim=-1)
+            # Scale by amplitude and accumulate
+            result[:, 0] += amp.view(-1, 1, 1, 1) * temp
         
-        # Reshape to spatial dimensions
-        result = result.view(batch_size, 1, *self._shape)
-        
-        return result
+        return torch.clamp(result, 0.0, 1.0)
 
     def decode_sequence(self, z: torch.Tensor):
         """Decode latent vector into sequence of Gaussian parameters."""
@@ -483,7 +483,11 @@ class TransformerGaussianDecoder(BaseDecoder):
         # Split parameters
         positions = params[..., :self._ndim].tanh()  # Positions in [-1,1]
         amplitudes = params[..., self._ndim].sigmoid()  # Amplitudes in [0,1]
-        sigmas = 0.1 + 0.9 * params[..., self._ndim+1:].sigmoid()  # Sigmas in [0.1,1]
+        
+        # Scale sigmas to desired range
+        min_sigma, max_sigma = self.splat_sigma_range
+        raw_sigmas = params[..., self._ndim+1:].sigmoid()  # Get raw sigmas in [0,1]
+        sigmas = min_sigma + (max_sigma - min_sigma) * raw_sigmas  # Scale to [min_sigma, max_sigma]
         
         # Create mask for valid positions
         batch_indices = torch.arange(batch_size, device=z.device)
