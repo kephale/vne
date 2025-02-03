@@ -407,7 +407,7 @@ class TransformerGaussianDecoder(BaseDecoder):
             )
 
     def _generate_gaussian_grid(self, positions, amplitudes, sigmas):
-        """Generate grid of Gaussian values."""
+        """Generate grid of Gaussian values using chunked processing."""
         device = positions.device
         batch_size = positions.shape[0]
 
@@ -421,21 +421,30 @@ class TransformerGaussianDecoder(BaseDecoder):
         sigmas = sigmas.view(batch_size, -1, sigmas.shape[-1])  # [batch, N, 3]
         amplitudes = amplitudes.view(batch_size, -1)  # [batch, N]
         
-        # Calculate distances efficiently
-        grid_coords = grid_coords.unsqueeze(0).unsqueeze(2)  # [1, P, 1, 3]
-        positions = positions.unsqueeze(1)  # [batch, 1, N, 3]
-        sigmas = sigmas.unsqueeze(1)  # [batch, 1, N, 3]
-        amplitudes = amplitudes.unsqueeze(1)  # [batch, 1, N]
+        # Process in chunks to reduce memory usage
+        chunk_size = 100000  # Adjust this based on available memory
+        n_points = grid_coords.shape[0]
+        n_chunks = (n_points + chunk_size - 1) // chunk_size
         
-        # Calculate squared distances
-        diff = (grid_coords - positions) / (sigmas + 1e-6)
-        dist_sq = torch.sum(diff * diff, dim=-1)
+        # Initialize output tensor
+        result = torch.zeros(batch_size, n_points, device=device)
         
-        # Calculate Gaussian values
-        gaussians = amplitudes * torch.exp(-0.5 * dist_sq)
-        
-        # Sum over Gaussians
-        result = torch.sum(gaussians, dim=-1)
+        for i in range(n_chunks):
+            start_idx = i * chunk_size
+            end_idx = min((i + 1) * chunk_size, n_points)
+            
+            # Process chunk of grid coordinates
+            grid_chunk = grid_coords[start_idx:end_idx].unsqueeze(0).unsqueeze(2)  # [1, chunk_size, 1, 3]
+            
+            # Calculate squared distances for chunk
+            diff = (grid_chunk - positions.unsqueeze(1)) / (sigmas.unsqueeze(1) + 1e-6)
+            dist_sq = torch.sum(diff * diff, dim=-1)
+            
+            # Calculate Gaussian values for chunk
+            gaussians = amplitudes.unsqueeze(1) * torch.exp(-0.5 * dist_sq)
+            
+            # Sum over Gaussians for this chunk
+            result[:, start_idx:end_idx] = torch.sum(gaussians, dim=-1)
         
         # Reshape to spatial dimensions
         result = result.view(batch_size, 1, *self._shape)
