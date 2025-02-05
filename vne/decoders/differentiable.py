@@ -413,10 +413,10 @@ class TransformerGaussianDecoder(BaseDecoder):
         device = positions.device
         batch_size = positions.shape[0]
         
-        # Initialize the output grid directly in final shape
+        # Initialize output grid
         result = torch.zeros(batch_size, 1, *self._shape, device=device)
         
-        # Create coordinate grid for each axis separately
+        # Create coordinate grids once
         coords = [torch.linspace(-1, 1, s, device=device) for s in self._shape]
         
         # Reshape parameters
@@ -424,31 +424,52 @@ class TransformerGaussianDecoder(BaseDecoder):
         sigmas = sigmas.view(batch_size, -1, sigmas.shape[-1])  # [batch, N, 3]
         amplitudes = amplitudes.view(batch_size, -1)  # [batch, N]
         
-        # Process each gaussian separately and accumulate
-        for i in range(positions.shape[1]):  # For each splat
-            # Get current gaussian parameters
-            pos = positions[:, i, :]  # [batch, 3]
-            sig = sigmas[:, i, :]     # [batch, 3]
-            amp = amplitudes[:, i]     # [batch]
-            
-            # Calculate gaussian values along each dimension separately
-            gaussian_components = []
-            for dim in range(3):
-                diff = (coords[dim].view(1, -1) - pos[:, dim].view(-1, 1)) / (sig[:, dim].view(-1, 1) + 1e-6)
-                gaussian_1d = torch.exp(-0.5 * diff * diff)  # [batch, dim_size]
-                gaussian_components.append(gaussian_1d)
-            
-            # Compute outer product to get 3D gaussian
-            # First dimension
-            temp = gaussian_components[0].unsqueeze(2).unsqueeze(3)  # [batch, x, 1, 1]
-            # Second dimension
-            temp = temp * gaussian_components[1].unsqueeze(1).unsqueeze(3)  # [batch, x, y, 1]
-            # Third dimension
-            temp = temp * gaussian_components[2].unsqueeze(1).unsqueeze(2)  # [batch, x, y, z]
-            
-            # Scale by amplitude and accumulate
-            result[:, 0] += amp.view(-1, 1, 1, 1) * temp
+        # Process gaussians in chunks to reduce memory usage
+        chunk_size = 32  # Adjust based on available GPU memory
+        num_gaussians = positions.shape[1]
         
+        for chunk_start in range(0, num_gaussians, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, num_gaussians)
+            chunk_size_actual = chunk_end - chunk_start
+            
+            # Get current chunk parameters
+            pos_chunk = positions[:, chunk_start:chunk_end, :]
+            sig_chunk = sigmas[:, chunk_start:chunk_end, :]
+            amp_chunk = amplitudes[:, chunk_start:chunk_end]
+            
+            # Pre-allocate gaussian components for the chunk
+            gaussian_x = torch.empty(batch_size, chunk_size_actual, self._shape[0], device=device)
+            gaussian_y = torch.empty(batch_size, chunk_size_actual, self._shape[1], device=device)
+            gaussian_z = torch.empty(batch_size, chunk_size_actual, self._shape[2], device=device)
+            
+            # Calculate 1D gaussians for each dimension
+            for dim, (coord, gaussian_out) in enumerate(zip(coords, [gaussian_x, gaussian_y, gaussian_z])):
+                # Reshape for broadcasting
+                coord_grid = coord.view(1, 1, -1)  # [1, 1, dim_size]
+                pos_dim = pos_chunk[..., dim].unsqueeze(-1)  # [batch, chunk_size, 1]
+                sig_dim = sig_chunk[..., dim].unsqueeze(-1)  # [batch, chunk_size, 1]
+                
+                # Compute gaussian values
+                diff = (coord_grid - pos_dim) / (sig_dim + 1e-6)
+                gaussian_out.copy_(-0.5 * diff * diff)
+                gaussian_out.exp_()
+            
+            # Compute 3D gaussians for the chunk efficiently
+            # Process each batch item separately to reduce memory
+            for b in range(batch_size):
+                # Process each gaussian in the chunk
+                for i in range(chunk_size_actual):
+                    # Compute 3D gaussian using outer products
+                    temp = gaussian_x[b, i].unsqueeze(1).unsqueeze(2)  # [x, 1, 1]
+                    temp.mul_(gaussian_y[b, i].unsqueeze(0).unsqueeze(2))  # [x, y, 1]
+                    temp.mul_(gaussian_z[b, i].unsqueeze(0).unsqueeze(1))  # [x, y, z]
+                    
+                    # Scale by amplitude and accumulate
+                    result[b, 0].add_(temp * amp_chunk[b, i])
+            
+            # Free memory explicitly
+            del gaussian_x, gaussian_y, gaussian_z, temp
+            
         return torch.clamp(result, 0.0, 1.0)
 
     def decode_sequence(self, z: torch.Tensor):
