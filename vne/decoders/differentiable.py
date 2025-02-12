@@ -123,7 +123,7 @@ class ChunkedGaussianSplatRenderer(BaseDecoder):
     def __init__(
         self,
         shape: Tuple[int],
-        chunk_size: int = 32_768,  # Number of coordinates per chunk (e.g., 32^3)
+        chunk_size: int = 262144,  # Number of coordinates per chunk (e.g., 64^3)
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__()
@@ -146,6 +146,31 @@ class ChunkedGaussianSplatRenderer(BaseDecoder):
 
         coords = torch.stack([torch.ravel(grid) for grid in grids], axis=0).transpose(0, 1).unsqueeze(0)
         self.register_buffer('coords', coords)
+
+    def compute_chunk(
+        self,
+        coords_chunk: torch.Tensor,
+        splats: torch.Tensor,
+        weights: torch.Tensor,
+        sigmas: torch.Tensor,
+        splats_norm: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute result for a single chunk of coordinates."""
+        # Calculate chunk distances
+        coords_norm = torch.sum(coords_chunk ** 2, dim=-1, keepdim=True)  # [1, chunk_size, 1]
+        cross_term = torch.matmul(coords_chunk, splats)  # [B, chunk_size, N]
+        
+        # Calculate squared distances for chunk
+        D_squared = coords_norm + splats_norm.unsqueeze(1) - 2 * cross_term  # [B, chunk_size, N]
+        D_squared = torch.clamp(D_squared, min=0.0)
+        
+        # Calculate gaussian values for chunk
+        gaussian_values = weights.unsqueeze(1) * torch.exp(
+            torch.clamp(-D_squared / sigmas.unsqueeze(1), min=-88.0)
+        )
+        
+        # Sum gaussian values for this chunk
+        return torch.sum(gaussian_values, dim=-1)  # [B, chunk_size]
 
     def forward(
         self,
@@ -176,40 +201,33 @@ class ChunkedGaussianSplatRenderer(BaseDecoder):
         )
         sigmas = 2.0 * sigmas ** 2  # [B, N]
         
-        # Initialize output tensor
         batch_size = splats.shape[0]
         n_coords = self.coords.shape[1]
-        result = torch.zeros(batch_size, n_coords, device=device, requires_grad=splats.requires_grad)
+        result_chunks = []
         
         # Process coordinates in chunks
         for coord_idx in range(0, n_coords, self.chunk_size):
             end_idx = min(coord_idx + self.chunk_size, n_coords)
             coords_chunk = self.coords[:, coord_idx:end_idx, :]  # [1, chunk_size, D]
             
-            # Calculate chunk distances
-            coords_norm = torch.sum(coords_chunk ** 2, dim=-1, keepdim=True)  # [1, chunk_size, 1]
-            cross_term = torch.matmul(coords_chunk, splats)  # [B, chunk_size, N]
-            
-            # Calculate squared distances for chunk
-            D_squared = coords_norm + splats_norm.unsqueeze(1) - 2 * cross_term  # [B, chunk_size, N]
-            D_squared = torch.clamp(D_squared, min=0.0)
-            
-            # Calculate gaussian values for chunk
-            gaussian_values = weights.unsqueeze(1) * torch.exp(
-                torch.clamp(-D_squared / sigmas.unsqueeze(1), min=-88.0)
+            # Compute chunk result
+            chunk_result = self.compute_chunk(
+                coords_chunk, splats, weights, sigmas, splats_norm
             )
+            result_chunks.append(chunk_result)
             
-            # Sum gaussian values for this chunk
-            result[:, coord_idx:end_idx] = torch.sum(gaussian_values, dim=-1)
-            
-            # Free memory
-            del D_squared, gaussian_values, cross_term
             if not torch.is_grad_enabled():
                 torch.cuda.empty_cache()
         
-        # Normalize and reshape result
+        # Concatenate chunks along coordinate dimension
+        result = torch.cat(result_chunks, dim=1)  # [B, n_coords]
+        
+        # Apply final operations without inplace modifications
         result = torch.clamp(result, 0.0, 1.0)
-        return result.reshape((-1, *self._shape)).unsqueeze(1)
+        result = result.reshape(-1, *self._shape)
+        result = result.unsqueeze(1)
+        
+        return result
 
 class SoftStep(torch.nn.Module):
     """Soft (differentiable) step function in the range of 0-1."""
