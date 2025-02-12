@@ -117,6 +117,110 @@ class GaussianSplatRenderer(BaseDecoder):
 
         return x.reshape((-1, *self._shape)).unsqueeze(1)
 
+class ChunkedGaussianSplatRenderer(BaseDecoder):
+    """Memory-efficient Gaussian splat renderer that processes splats in chunks."""
+
+    def __init__(
+        self,
+        shape: Tuple[int],
+        chunk_size: int = 32,  # Number of splats to process at once
+        device: torch.device = torch.device("cpu"),
+    ):
+        super().__init__()
+        self._shape = shape
+        self._ndim = len(shape)
+        self.chunk_size = chunk_size
+
+        if len(shape) not in (SpatialDims.TWO, SpatialDims.THREE):
+            raise ValueError("Only 2D or 3D rotations are currently supported")
+
+        # Create coordinate grid and register as buffer
+        grids = torch.meshgrid(
+            *[torch.linspace(-1, 1, sz) for sz in shape],
+            indexing="xy",
+        )
+
+        # Add zeros for z if we have a 2d grid
+        if len(shape) == SpatialDims.TWO:
+            grids += (torch.zeros_like(grids[0]),)
+
+        coords = torch.stack([torch.ravel(grid) for grid in grids], axis=0).transpose(0, 1).unsqueeze(0)
+        self.register_buffer('coords', coords)
+
+    def forward(
+        self,
+        splats: torch.Tensor, 
+        weights: torch.Tensor,
+        sigmas: torch.Tensor,
+        *,
+        splat_sigma_range: Tuple[float] = (0.0, 1.0),
+    ) -> torch.Tensor:
+        """Render Gaussian splats using chunked processing to reduce memory usage."""
+        
+        # Ensure inputs are on same device as coords
+        device = self.coords.device
+        splats = splats.to(device)
+        weights = weights.to(device)
+        sigmas = sigmas.to(device)
+        
+        # Get dimensions
+        batch_size = splats.shape[0]
+        n_splats = splats.shape[2]
+        n_coords = self.coords.shape[1]
+        
+        # Initialize output tensor
+        result = torch.zeros(batch_size, n_coords, device=device)
+        
+        # Process splats in chunks
+        for chunk_start in range(0, n_splats, self.chunk_size):
+            chunk_end = min(chunk_start + self.chunk_size, n_splats)
+            
+            # Get current chunk
+            splats_chunk = splats[:, :, chunk_start:chunk_end]  # [B, D, chunk_size]
+            weights_chunk = weights[:, chunk_start:chunk_end]    # [B, chunk_size]
+            sigmas_chunk = sigmas[:, chunk_start:chunk_end]     # [B, chunk_size]
+            
+            # Scale sigma values
+            min_sigma, max_sigma = splat_sigma_range
+            sigmas_chunk = torch.clamp(
+                sigmas_chunk * (max_sigma - min_sigma) + min_sigma,
+                min=1e-6,
+                max=1.0
+            )
+            
+            # Calculate distances for this chunk
+            splats_t = splats_chunk.transpose(1, 2)  # [B, chunk_size, D]
+            coords_norm = torch.sum(self.coords ** 2, dim=-1, keepdim=True)  # [1, M, 1]
+            splats_norm = torch.sum(splats_t ** 2, dim=-1)  # [B, chunk_size]
+            
+            # Compute cross term for chunk
+            cross_term = torch.matmul(self.coords, splats_chunk)  # [B, M, chunk_size]
+            
+            # Calculate squared distances
+            D_squared = coords_norm + splats_norm.unsqueeze(1) - 2 * cross_term  # [B, M, chunk_size]
+            D_squared = torch.clamp(D_squared, min=0.0)
+            
+            # Scale gaussians
+            sigmas_chunk = 2.0 * sigmas_chunk.unsqueeze(1) ** 2  # [B, 1, chunk_size]
+            
+            # Calculate gaussian values for chunk
+            gaussian_values = weights_chunk.unsqueeze(1) * torch.exp(
+                torch.clamp(-D_squared / sigmas_chunk, min=-88.0)
+            )
+            
+            # Accumulate results
+            result += torch.sum(gaussian_values, dim=-1)
+            
+            # Explicitly free memory
+            del D_squared, gaussian_values, cross_term
+            torch.cuda.empty_cache()
+        
+        # Clamp final result
+        result = torch.clamp(result, 0.0, 1.0)
+        
+        # Reshape to final volume shape
+        return result.reshape((-1, *self._shape)).unsqueeze(1)
+
 class SoftStep(torch.nn.Module):
     """Soft (differentiable) step function in the range of 0-1."""
 
@@ -130,7 +234,6 @@ class SoftStep(torch.nn.Module):
 class Negate(torch.nn.Module):
     def forward(self, x):
         return -x
-
 
 class GaussianSplatDecoder(BaseDecoder):
     """Differentiable Gaussian splat decoder.
@@ -176,6 +279,7 @@ class GaussianSplatDecoder(BaseDecoder):
         splat_sigma_range: Tuple[float, float] = (0.02, 0.1),
         default_axis: CartesianAxes = CartesianAxes.Z,
         device: torch.device = torch.device("cpu"),
+        chunk_size: int = 0
     ):
         super().__init__()
 
@@ -185,6 +289,7 @@ class GaussianSplatDecoder(BaseDecoder):
         self._output_channels = output_channels
         self._splat_sigma_range = splat_sigma_range
         self._default_axis = default_axis.as_tensor()
+        self._chunk_size = chunk_size
 
         # Register networks and move to specified device
         self.centroids = torch.nn.Sequential(
@@ -206,10 +311,17 @@ class GaussianSplatDecoder(BaseDecoder):
         ).to(device)
 
         # Initialize renderer
-        self._splatter = GaussianSplatRenderer(
-            shape,
-            device=device,
-        ).to(device)
+        if chunk_size == 0:
+            self._splatter = GaussianSplatRenderer(
+                shape,
+                device=device,
+            ).to(device)
+        else:
+            self._splatter = ChunkedGaussianSplatRenderer(
+                shape,
+                chunk_size=chunk_size,
+                device=device,
+            ).to(device)
 
         # Add final conv decoder if needed
         if output_channels is not None:
