@@ -118,12 +118,12 @@ class GaussianSplatRenderer(BaseDecoder):
         return x.reshape((-1, *self._shape)).unsqueeze(1)
 
 class ChunkedGaussianSplatRenderer(BaseDecoder):
-    """Memory-efficient Gaussian splat renderer that processes coordinates in chunks."""
+    """Memory-efficient Gaussian splat renderer that processes coordinates in chunks and uses gradient checkpointing."""
 
     def __init__(
         self,
         shape: Tuple[int],
-        chunk_size: int = 262144,  # Number of coordinates per chunk (e.g., 64^3)
+        chunk_size: int = 32**3,
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__()
@@ -147,15 +147,9 @@ class ChunkedGaussianSplatRenderer(BaseDecoder):
         coords = torch.stack([torch.ravel(grid) for grid in grids], axis=0).transpose(0, 1).unsqueeze(0)
         self.register_buffer('coords', coords)
 
-    def compute_chunk(
-        self,
-        coords_chunk: torch.Tensor,
-        splats: torch.Tensor,
-        weights: torch.Tensor,
-        sigmas: torch.Tensor,
-        splats_norm: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute result for a single chunk of coordinates."""
+    @staticmethod
+    def chunk_function(coords_chunk, splats, weights, sigmas, splats_norm):
+        """Static function for gradient checkpointing."""
         # Calculate chunk distances
         coords_norm = torch.sum(coords_chunk ** 2, dim=-1, keepdim=True)  # [1, chunk_size, 1]
         cross_term = torch.matmul(coords_chunk, splats)  # [B, chunk_size, N]
@@ -169,7 +163,7 @@ class ChunkedGaussianSplatRenderer(BaseDecoder):
             torch.clamp(-D_squared / sigmas.unsqueeze(1), min=-88.0)
         )
         
-        # Sum gaussian values for this chunk
+        # Sum gaussian values for chunk
         return torch.sum(gaussian_values, dim=-1)  # [B, chunk_size]
 
     def forward(
@@ -180,7 +174,7 @@ class ChunkedGaussianSplatRenderer(BaseDecoder):
         *,
         splat_sigma_range: Tuple[float] = (0.0, 1.0),
     ) -> torch.Tensor:
-        """Render Gaussian splats using chunked processing to reduce memory usage."""
+        """Render Gaussian splats using chunked processing with gradient checkpointing."""
         
         # Ensure inputs are on same device as coords
         device = self.coords.device
@@ -205,24 +199,27 @@ class ChunkedGaussianSplatRenderer(BaseDecoder):
         n_coords = self.coords.shape[1]
         result_chunks = []
         
-        # Process coordinates in chunks
+        # Process coordinates in chunks with gradient checkpointing
         for coord_idx in range(0, n_coords, self.chunk_size):
             end_idx = min(coord_idx + self.chunk_size, n_coords)
             coords_chunk = self.coords[:, coord_idx:end_idx, :]  # [1, chunk_size, D]
             
-            # Compute chunk result
-            chunk_result = self.compute_chunk(
-                coords_chunk, splats, weights, sigmas, splats_norm
+            # Use gradient checkpointing for this chunk
+            chunk_result = torch.utils.checkpoint.checkpoint(
+                self.chunk_function,
+                coords_chunk, 
+                splats,
+                weights,
+                sigmas,
+                splats_norm,
+                preserve_rng_state=False
             )
             result_chunks.append(chunk_result)
-            
-            if not torch.is_grad_enabled():
-                torch.cuda.empty_cache()
         
         # Concatenate chunks along coordinate dimension
         result = torch.cat(result_chunks, dim=1)  # [B, n_coords]
         
-        # Apply final operations without inplace modifications
+        # Apply final operations
         result = torch.clamp(result, 0.0, 1.0)
         result = result.reshape(-1, *self._shape)
         result = result.unsqueeze(1)
