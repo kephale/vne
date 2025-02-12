@@ -226,6 +226,153 @@ class ChunkedGaussianSplatRenderer(BaseDecoder):
         
         return result
 
+class OptimizedGaussianRenderer(BaseDecoder):
+    """Memory-efficient Gaussian renderer using hierarchical evaluation.
+    
+    This renderer uses a multi-resolution approach:
+    1. First evaluates Gaussians on a coarse grid to identify active regions
+    2. Only evaluates full resolution in regions where Gaussians contribute significantly
+    3. Uses sparse tensor operations for efficiency
+    """
+    
+    def __init__(
+        self,
+        shape: Tuple[int],
+        coarse_factor: int = 8,  # Reduction factor for coarse grid
+        activation_threshold: float = 0.01,  # Threshold for considering a region active
+        device: torch.device = torch.device("cpu")
+    ):
+        super().__init__()
+        self._shape = shape
+        self._ndim = len(shape)
+        self.coarse_factor = coarse_factor
+        self.activation_threshold = activation_threshold
+        
+        # Create coarse grid coordinates
+        coarse_shape = tuple(s // coarse_factor for s in shape)
+        grids = torch.meshgrid(
+            *[torch.linspace(-1, 1, sz) for sz in coarse_shape],
+            indexing="xy"
+        )
+        coords = torch.stack([torch.ravel(grid) for grid in grids], axis=0).transpose(0, 1).unsqueeze(0)
+        self.register_buffer('coarse_coords', coords)
+        
+        # Precompute fine grid offsets within each coarse cell
+        offset_grids = torch.meshgrid(
+            *[torch.linspace(0, 1, coarse_factor, device=device) for _ in range(3)],
+            indexing="xy"
+        )
+        offsets = torch.stack([g.reshape(-1) for g in offset_grids], dim=1)
+        self.register_buffer('cell_offsets', offsets)
+        
+    def _evaluate_coarse(self, splats, weights, sigmas):
+        """Evaluate Gaussians on coarse grid to identify active regions."""
+        device = splats.device
+        
+        # Calculate squared distances on coarse grid
+        coords_norm = torch.sum(self.coarse_coords ** 2, dim=-1, keepdim=True)
+        splats_t = splats.transpose(1, 2)
+        splats_norm = torch.sum(splats_t ** 2, dim=-1)
+        cross_term = torch.matmul(self.coarse_coords, splats)
+        
+        D_squared = coords_norm + splats_norm.unsqueeze(1) - 2 * cross_term
+        D_squared = torch.clamp(D_squared, min=0.0)
+        
+        # Calculate Gaussian values on coarse grid
+        sigmas_2d = 2.0 * sigmas.unsqueeze(1) ** 2
+        gaussian_values = weights.unsqueeze(1) * torch.exp(
+            torch.clamp(-D_squared / sigmas_2d, min=-88.0)
+        )
+        
+        # Sum contributions and reshape to coarse grid
+        coarse_result = torch.sum(gaussian_values, dim=-1)
+        coarse_shape = tuple(s // self.coarse_factor for s in self._shape)
+        coarse_volume = coarse_result.reshape((-1, *coarse_shape))
+        
+        # Identify active regions
+        active_mask = coarse_volume > self.activation_threshold
+        active_indices = torch.nonzero(active_mask)
+        
+        return active_indices, coarse_volume
+        
+    def _evaluate_fine_region(self, region_idx, splats, weights, sigmas):
+        """Evaluate Gaussians at full resolution for a specific coarse grid region."""
+        device = splats.device
+        batch_idx = region_idx[0]
+        spatial_idx = region_idx[1:]
+        
+        # Calculate base coordinates for this region
+        base_coords = torch.tensor(spatial_idx, device=device).float()
+        base_coords = 2 * base_coords / torch.tensor(self._shape, device=device) * self.coarse_factor - 1
+        
+        # Generate fine coordinates using offsets
+        fine_coords = base_coords.unsqueeze(0) + self.cell_offsets * (2.0 / torch.tensor(self._shape, device=device)) * self.coarse_factor
+        
+        # Evaluate Gaussians on fine coordinates
+        coords_norm = torch.sum(fine_coords ** 2, dim=-1, keepdim=True)
+        splats_t = splats[batch_idx].transpose(0, 1)
+        splats_norm = torch.sum(splats_t ** 2, dim=-1)
+        cross_term = torch.matmul(fine_coords, splats[batch_idx])
+        
+        D_squared = coords_norm + splats_norm.unsqueeze(0) - 2 * cross_term
+        D_squared = torch.clamp(D_squared, min=0.0)
+        
+        # Calculate Gaussian values
+        sigmas_2d = 2.0 * sigmas[batch_idx].unsqueeze(0) ** 2
+        gaussian_values = weights[batch_idx].unsqueeze(0) * torch.exp(
+            torch.clamp(-D_squared / sigmas_2d, min=-88.0)
+        )
+        
+        # Sum contributions
+        fine_result = torch.sum(gaussian_values, dim=-1)
+        return fine_result.reshape(self.coarse_factor, self.coarse_factor, self.coarse_factor)
+        
+    def forward(
+        self,
+        splats: torch.Tensor,
+        weights: torch.Tensor,
+        sigmas: torch.Tensor,
+        *,
+        splat_sigma_range: Tuple[float] = (0.0, 1.0),
+    ) -> torch.Tensor:
+        """Render Gaussians using hierarchical evaluation."""
+        device = splats.device
+        batch_size = splats.shape[0]
+        
+        # Scale parameters
+        weights = torch.clamp(weights, 0.0, 1.0)
+        min_sigma, max_sigma = splat_sigma_range
+        sigmas = torch.clamp(
+            sigmas * (max_sigma - min_sigma) + min_sigma,
+            min=1e-6,
+            max=1.0
+        )
+        
+        # Evaluate on coarse grid
+        active_indices, coarse_result = self._evaluate_coarse(splats, weights, sigmas)
+        
+        # Initialize output volume
+        result = torch.zeros((batch_size, *self._shape), device=device)
+        
+        # Process each active region
+        for idx in active_indices:
+            batch_idx = idx[0]
+            fine_result = self._evaluate_fine_region(idx, splats, weights, sigmas)
+            
+            # Calculate output slice indices
+            start_idx = idx[1:] * self.coarse_factor
+            end_idx = start_idx + self.coarse_factor
+            
+            # Update output volume
+            result[batch_idx, 
+                  start_idx[0]:end_idx[0],
+                  start_idx[1]:end_idx[1],
+                  start_idx[2]:end_idx[2]] = fine_result
+            
+        # Normalize and reshape
+        result = torch.clamp(result, 0.0, 1.0)
+        return result.unsqueeze(1)
+
 class SoftStep(torch.nn.Module):
     """Soft (differentiable) step function in the range of 0-1."""
 
@@ -457,6 +604,208 @@ class GaussianSplatDecoder(BaseDecoder):
             x = self._decoder(x)
 
         return x
+
+class HierarchicalGaussianSplatDecoder(BaseDecoder):
+    """Decoder using hierarchical Gaussian evaluation.
+    
+    Parameters
+    ----------
+    shape : tuple
+        A tuple describing the output shape of the image data. Can be 2- or 3-
+        dimensional. For example: (32, 32, 32)
+    n_splats : int
+        The number of Gaussians in the mixture model.
+    latent_dims : int
+        The dimensions of the latent representation.
+    output_channels : int, optional
+        The number of output channels in the final image volume. If not
+        supplied, this will default to 1. If it is supplied, additional
+        convolutions are applied to the GMM model.
+    splat_sigma_range : tuple[float]
+        The minimum and maximum sigma values for each splat. Useful to control
+        the resolution of the final render.
+    default_axis : CartesianAxes
+        A default cartesian axis to use for rotation if the pose is provided by
+        a rotation only. Default is Z, equivalent to a typical image rotation
+        about the central axis.
+    """
+    
+    def __init__(
+        self,
+        shape: Tuple[int],
+        n_splats: int = 128,
+        latent_dims: int = 8,
+        output_channels: Optional[int] = None,
+        splat_sigma_range: Tuple[float] = (0.02, 0.1),
+        default_axis: CartesianAxes = CartesianAxes.Z,
+        device: torch.device = torch.device("cpu"),
+        coarse_factor: int = 8
+    ):
+        super().__init__()
+        
+        self._device = device
+        self._shape = shape
+        self._ndim = len(shape)
+        self._output_channels = output_channels
+        self._splat_sigma_range = splat_sigma_range
+        self._default_axis = default_axis.as_tensor()
+        
+        # Networks for Gaussian parameters
+        self.centroids = nn.Sequential(
+            nn.Linear(latent_dims, n_splats * 3),
+            nn.ReLU(),
+            nn.Linear(n_splats * 3, n_splats * 3),
+            nn.Tanh(),
+        ).to(device)
+        
+        self.weights = nn.Sequential(
+            nn.Linear(latent_dims, n_splats),
+            nn.Tanh(),
+            nn.Sigmoid(),
+        ).to(device)
+        
+        self.sigmas = nn.Sequential(
+            nn.Linear(latent_dims, n_splats),
+            nn.Sigmoid(),
+        ).to(device)
+        
+        # Initialize hierarchical renderer
+        self._splatter = OptimizedGaussianRenderer(
+            shape,
+            coarse_factor=coarse_factor,
+            device=device
+        ).to(device)
+        
+        # Optional final convolution
+        if output_channels is not None:
+            conv = (
+                torch.nn.Conv3d
+                if self._ndim == SpatialDims.THREE
+                else torch.nn.Conv2d
+            )
+
+            self._decoder = torch.nn.Sequential(
+                Negate(),
+                conv(1, 1, kernel_size=1),
+                conv(1, output_channels, kernel_size=9, padding="same"),
+            ).to(device)
+
+    def decode_splats(
+        self, z: torch.Tensor, pose: torch.Tensor
+    ) -> Tuple[torch.Tensor]:
+        """Decode the splats to retrieve the coordinates, weights and sigmas."""
+        if pose.shape[-1] not in (1, 4):
+            raise ValueError(
+                "Pose needs to be either a single angle rotation about the "
+                "`default_axis` or a full angle-axis representation in 3D. "
+            )
+
+        # Move inputs to correct device and predict parameters
+        z = z.to(self._device)
+        pose = pose.to(self._device)
+        
+        splats = self.centroids(z).view(z.shape[0], 3, -1)
+        weights = self.weights(z)
+        sigmas = self.sigmas(z)
+
+        # Get batch size
+        batch_size = z.shape[0]
+
+        # Handle single dimension pose
+        if pose.shape[-1] == 1:
+            pose = torch.concat(
+                [
+                    pose,
+                    torch.tile(self._default_axis, (batch_size, 1)).to(self._device),
+                ],
+                axis=-1,
+            )
+
+        # Convert axis angles to quaternions
+        assert pose.shape[-1] == 4, pose.shape
+        quaternions = axis_angle_to_quaternion(pose, normalize=True)
+
+        # Convert quaternions to rotation matrices
+        rotation_matrices = quaternion_to_rotation_matrix(quaternions)
+
+        # Rotate the 3D points using the rotation matrices
+        rotated_splats = torch.matmul(
+            rotation_matrices,
+            splats,
+        )
+
+        # Use only the required spatial dimensions
+        rotated_splats = rotated_splats[:, :self._ndim, :]
+
+        return rotated_splats, weights, sigmas
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        pose: torch.Tensor,
+        *,
+        use_final_convolution: bool = True,
+    ) -> torch.Tensor:
+        """Decode the latents to an image volume given an explicit transform.
+
+        Parameters
+        ----------
+        z : tensor
+            An (N, D) tensor specifying the D dimensional latent encodings for
+            the minibatch of N images.
+        pose : tensor
+            An (N, 1 | 4) tensor specifying the pose in terms of a single
+            rotation (assumed around the z-axis) or a full axis-angle rotation.
+        use_final_convolution: bool
+            Whether to apply the final convolutional layers to recover the image.
+            This can be useful to inspect the underlying structure in a trained
+            model.
+
+        Returns
+        -------
+        x : tensor
+            The decoded image from the latents and pose.
+        """
+
+        # Decode the splats from the latents and pose
+        splats, weights, sigmas = self.decode_splats(z, pose)
+
+        # Apply the gaussian splat renderer
+        x = self._splatter(
+            splats, weights, sigmas, splat_sigma_range=self._splat_sigma_range
+        )
+
+        # Apply final convolution if needed
+        if self._output_channels is not None and use_final_convolution:
+            x = self._decoder(x)
+
+        return x
+
+    def configure_renderer(
+        self,
+        shape: Tuple[int],
+        *,
+        splat_sigma_range: Tuple[float, float] = (0.02, 0.1),
+        default_axis: CartesianAxes = CartesianAxes.Z,
+        device: torch.device = torch.device("cpu"),
+        coarse_factor: int = 8
+    ) -> None:
+        """Reconfigure the renderer.
+
+        Notes
+        -----
+        This might be useful to do once a model is trained. For example, one
+        could change the resolution of the rendered image by changing the
+        `shape` of the output.
+        """
+        self._shape = shape
+        self._default_axis = default_axis.as_tensor()
+        self._splatter = OptimizedGaussianRenderer(
+            shape,
+            coarse_factor=coarse_factor,
+            device=device,
+        )
+        self._splat_sigma_range = splat_sigma_range
 
 
 class DownsampledGaussianSplatRenderer(BaseDecoder):
