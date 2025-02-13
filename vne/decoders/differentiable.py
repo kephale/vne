@@ -858,7 +858,7 @@ class DownsampledGaussianSplatRenderer(BaseDecoder):
         sigmas = sigmas.to(device)
         
         # Adjust sigmas for downsampled space
-        sigmas = sigmas * self.downsample_factor
+        sigmas = sigmas / self.downsample_factor
         
         # Clamp weights
         weights = torch.clamp(weights, 0.0, 1.0)
