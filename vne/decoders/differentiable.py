@@ -388,38 +388,7 @@ class Negate(torch.nn.Module):
         return -x
 
 class GaussianSplatDecoder(BaseDecoder):
-    """Differentiable Gaussian splat decoder.
-
-    Parameters
-    ----------
-    shape : tuple
-        A tuple describing the output shape of the image data. Can be 2- or 3-
-        dimensional. For example: (32, 32, 32)
-    n_splats : int
-        The number of Gaussians in the mixture model.
-    latent_dims : int
-        The dimensions of the latent representation.
-    output_channels : int, optional
-        The number of output channels in the final image volume. If not
-        supplied, this will default to 1. If it is supplied, additional
-        convolutions are applied to the GMM model.
-    splat_sigma_range : tuple[float]
-        The minimum and maximum sigma values for each splat. Useful to control
-        the resolution of the final render.
-    default_axis : CartesianAxes
-        A default cartesian axis to use for rotation if the pose is provided by
-        a rotation only. Default is Z, equivalent to a typical image rotation
-        about the central axis.
-
-    Notes
-    -----
-    Takes the latent code and pose estimate to generate a planar or volumetric
-    image.  The code is used to position N symmetric gaussians in the image
-    volume which are then rotated by an explicit rotation transform. These are
-    rendered as an image by evaluating the list of gaussians as a GMM.
-
-    The renderer is differentiable and can therefore be used during training.
-    """
+    """Differentiable Gaussian splat decoder with padding for convolution edge effects."""
 
     def __init__(
         self,
@@ -431,7 +400,8 @@ class GaussianSplatDecoder(BaseDecoder):
         splat_sigma_range: Tuple[float, float] = (0.02, 0.1),
         default_axis: CartesianAxes = CartesianAxes.Z,
         device: torch.device = torch.device("cpu"),
-        chunk_size: int = 0
+        chunk_size: int = 0,
+        padding: int = 4  # Default padding for 9x9 convolution
     ):
         super().__init__()
 
@@ -442,6 +412,10 @@ class GaussianSplatDecoder(BaseDecoder):
         self._splat_sigma_range = splat_sigma_range
         self._default_axis = default_axis.as_tensor()
         self._chunk_size = chunk_size
+        self._padding = padding
+
+        if len(shape) not in (SpatialDims.TWO, SpatialDims.THREE):
+            raise ValueError("Only 2D or 3D rotations are currently supported")
 
         # Register networks and move to specified device
         self.centroids = torch.nn.Sequential(
@@ -462,15 +436,18 @@ class GaussianSplatDecoder(BaseDecoder):
             torch.nn.Sigmoid(),
         ).to(device)
 
-        # Initialize renderer
+        # Calculate padded shape for renderer
+        padded_shape = tuple(s + 2 * padding for s in shape)
+
+        # Initialize renderer with padded shape
         if chunk_size == 0:
             self._splatter = GaussianSplatRenderer(
-                shape,
+                padded_shape,
                 device=device,
             ).to(device)
         else:
             self._splatter = ChunkedGaussianSplatRenderer(
-                shape,
+                padded_shape,
                 chunk_size=chunk_size,
                 device=device,
             ).to(device)
@@ -486,7 +463,7 @@ class GaussianSplatDecoder(BaseDecoder):
             self._decoder = torch.nn.Sequential(
                 Negate(),
                 conv(1, 1, kernel_size=1),
-                conv(1, output_channels, kernel_size=9, padding="same"),
+                conv(1, output_channels, kernel_size=9, padding="valid"),
             ).to(device)
 
     def configure_renderer(
@@ -497,18 +474,12 @@ class GaussianSplatDecoder(BaseDecoder):
         default_axis: CartesianAxes = CartesianAxes.Z,
         device: torch.device = torch.device("cpu"),
     ) -> None:
-        """Reconfigure the renderer.
-
-        Notes
-        -----
-        This might be useful to do once a model is trained. For example, one
-        could change the resolution of the rendered image by changing the
-        `shape` of the output.
-        """
+        """Reconfigure the renderer."""
         self._shape = shape
         self._default_axis = default_axis.as_tensor()
+        padded_shape = tuple(s + 2 * self._padding for s in shape)
         self._splatter = GaussianSplatRenderer(
-            shape,
+            padded_shape,
             device=device,
         )
         self._splat_sigma_range = splat_sigma_range
@@ -560,8 +531,15 @@ class GaussianSplatDecoder(BaseDecoder):
         # Use only the required spatial dimensions
         rotated_splats = rotated_splats[:, :self._ndim, :]
 
-        return rotated_splats, weights, sigmas
+        # Scale splats to account for padding
+        padded_shape = tuple(s + 2 * self._padding for s in self._shape)
+        scale_factors = torch.tensor(
+            [s2/s1 for s1, s2 in zip(self._shape, padded_shape)],
+            device=self._device
+        )
+        rotated_splats = rotated_splats * scale_factors.view(1, -1, 1)
 
+        return rotated_splats, weights, sigmas
 
     def forward(
         self,
@@ -602,6 +580,10 @@ class GaussianSplatDecoder(BaseDecoder):
         # Apply final convolution if needed
         if self._output_channels is not None and use_final_convolution:
             x = self._decoder(x)
+            
+            # Crop to original shape after convolution
+            slices = tuple(slice(self._padding, -self._padding) for _ in range(self._ndim))
+            x = x[(slice(None), slice(None)) + slices]  # Keep batch and channel dims
 
         return x
 
@@ -1063,216 +1045,7 @@ class DownsampledGaussianSplatDecoder(BaseDecoder):
 
         return x
 
-class PaddedGaussianSplatDecoder(BaseDecoder):
-    """Gaussian splat decoder with padding to handle convolution edge effects.
-
-    Parameters
-    ----------
-    shape : tuple
-        A tuple describing the output shape of the image data. Can be 2- or 3-
-        dimensional. For example: (32, 32, 32)
-    n_splats : int
-        The number of Gaussians in the mixture model.
-    latent_dims : int
-        The dimensions of the latent representation.
-    output_channels : int, optional
-        The number of output channels in the final image volume.
-    padding : int, optional
-        The amount of padding to add on each side. If not provided, will be
-        calculated from the convolution kernel size.
-    splat_sigma_range : tuple[float]
-        The minimum and maximum sigma values for each splat.
-    default_axis : CartesianAxes
-        A default cartesian axis to use for rotation if the pose is provided by
-        a rotation only. Default is Z.
-    """
-
-    def __init__(
-        self,
-        shape: Tuple[int],
-        *,
-        n_splats: int = 128,
-        latent_dims: int = 8,
-        output_channels: Optional[int] = None,
-        padding: Optional[int] = None,
-        splat_sigma_range: Tuple[float, float] = (0.02, 0.1),
-        default_axis: CartesianAxes = CartesianAxes.Z,
-        device: torch.device = torch.device("cpu"),
-        chunk_size: int = 0
-    ):
-        super().__init__()
-
-        self._device = device
-        self._shape = shape
-        self._ndim = len(shape)
-        self._output_channels = output_channels
-        self._splat_sigma_range = splat_sigma_range
-        self._default_axis = default_axis.as_tensor()
-        self._chunk_size = chunk_size
-
-        # Calculate padding size if not provided
-        if padding is None:
-            # Default padding based on 9x9 convolution kernel
-            self._padding = 4  # (9-1)//2
-        else:
-            self._padding = padding
-
-        # Calculate padded shape
-        self._padded_shape = tuple(s + 2 * self._padding for s in shape)
-
-        # Register networks and move to specified device
-        self.centroids = torch.nn.Sequential(
-            torch.nn.Linear(latent_dims, n_splats * 3),
-            torch.nn.ReLU(),
-            torch.nn.Linear(n_splats * 3, n_splats * 3),
-            torch.nn.Tanh(),
-        ).to(device)
-
-        self.weights = torch.nn.Sequential(
-            torch.nn.Linear(latent_dims, n_splats),
-            torch.nn.Tanh(),
-            SoftStep(k=10.0),
-        ).to(device)
-
-        self.sigmas = torch.nn.Sequential(
-            torch.nn.Linear(latent_dims, n_splats),
-            torch.nn.Sigmoid(),
-        ).to(device)
-
-        # Initialize renderer with padded shape
-        if chunk_size == 0:
-            self._splatter = GaussianSplatRenderer(
-                self._padded_shape,
-                device=device,
-            ).to(device)
-        else:
-            self._splatter = ChunkedGaussianSplatRenderer(
-                self._padded_shape,
-                chunk_size=chunk_size,
-                device=device,
-            ).to(device)
-
-        # Add final conv decoder if needed
-        if output_channels is not None:
-            conv = (
-                torch.nn.Conv3d
-                if self._ndim == SpatialDims.THREE
-                else torch.nn.Conv2d
-            )
-
-            self._decoder = torch.nn.Sequential(
-                Negate(),
-                conv(1, 1, kernel_size=1),
-                conv(1, output_channels, kernel_size=9, padding="valid"),
-            ).to(device)
-
-    def decode_splats(
-        self, z: torch.Tensor, pose: torch.Tensor
-    ) -> Tuple[torch.Tensor]:
-        """Decode the splats to retrieve the coordinates, weights and sigmas."""
-        if pose.shape[-1] not in (1, 4):
-            raise ValueError(
-                "Pose needs to be either a single angle rotation about the "
-                "`default_axis` or a full angle-axis representation in 3D. "
-            )
-
-        # Move inputs to correct device and predict parameters
-        z = z.to(self._device)
-        pose = pose.to(self._device)
         
-        splats = self.centroids(z).view(z.shape[0], 3, -1)
-        weights = self.weights(z)
-        sigmas = self.sigmas(z)
-
-        # Get batch size
-        batch_size = z.shape[0]
-
-        # Handle single dimension pose
-        if pose.shape[-1] == 1:
-            pose = torch.concat(
-                [
-                    pose,
-                    torch.tile(self._default_axis, (batch_size, 1)).to(self._device),
-                ],
-                axis=-1,
-            )
-
-        # Convert axis angles to quaternions
-        assert pose.shape[-1] == 4, pose.shape
-        quaternions = axis_angle_to_quaternion(pose, normalize=True)
-
-        # Convert quaternions to rotation matrices
-        rotation_matrices = quaternion_to_rotation_matrix(quaternions)
-
-        # Rotate the 3D points using the rotation matrices
-        rotated_splats = torch.matmul(
-            rotation_matrices,
-            splats,
-        )
-
-        # Use only the required spatial dimensions
-        rotated_splats = rotated_splats[:, :self._ndim, :]
-
-        # Scale splats to account for padding
-        scale_factors = torch.tensor(
-            [s2/s1 for s1, s2 in zip(self._shape, self._padded_shape)],
-            device=self._device
-        )
-        rotated_splats = rotated_splats * scale_factors.view(1, -1, 1)
-
-        return rotated_splats, weights, sigmas
-
-    def forward(
-        self,
-        z: torch.Tensor,
-        pose: torch.Tensor,
-        *,
-        use_final_convolution: bool = True,
-    ) -> torch.Tensor:
-        """Decode the latents to an image volume given an explicit transform."""
-
-        # Decode the splats from the latents and pose
-        splats, weights, sigmas = self.decode_splats(z, pose)
-
-        # Apply the gaussian splat renderer (using padded shape)
-        x = self._splatter(
-            splats, weights, sigmas, splat_sigma_range=self._splat_sigma_range
-        )
-
-        # Apply final convolution if needed
-        if self._output_channels is not None and use_final_convolution:
-            x = self._decoder(x)
-
-        # Calculate crop slices to remove padding
-        slices = tuple(slice(self._padding, -self._padding) for _ in range(self._ndim))
-        x = x[(slice(None), slice(None)) + slices]  # Keep batch and channel dims
-
-        return x
-
-    def configure_renderer(
-        self,
-        shape: Tuple[int],
-        *,
-        splat_sigma_range: Tuple[float, float] = (0.02, 0.1),
-        default_axis: CartesianAxes = CartesianAxes.Z,
-        device: torch.device = torch.device("cpu"),
-    ) -> None:
-        """Reconfigure the renderer.
-
-        Notes
-        -----
-        This might be useful to do once a model is trained. For example, one
-        could change the resolution of the rendered image by changing the
-        `shape` of the output.
-        """
-        self._shape = shape
-        self._padded_shape = tuple(s + 2 * self._padding for s in shape)
-        self._default_axis = default_axis.as_tensor()
-        self._splatter = GaussianSplatRenderer(
-            self._padded_shape,
-            device=device,
-        )
-        self._splat_sigma_range = splat_sigma_range
 
 class TransformerGaussianDecoder(BaseDecoder):
     def __init__(
