@@ -560,15 +560,23 @@ class GaussianSplatDecoder(BaseDecoder):
             rotation (assumed around the z-axis) or a full axis-angle rotation.
         use_final_convolution: bool
             Whether to apply the final convolutional layers to recover the image.
-            This can be useful to inspect the underlying structure in a trained
-            model.
 
         Returns
         -------
         x : tensor
-            The decoded image from the latents and pose.
+            The decoded image from the latents and pose, same size as input.
         """
-
+        # Calculate total padding needed
+        conv_padding = 4  # For the 9x9 convolution
+        total_padding = self._padding + conv_padding
+        
+        # Calculate expanded shape for rendering
+        expanded_shape = tuple(s + 2 * total_padding for s in self._shape)
+        
+        # Temporarily configure renderer for expanded shape
+        original_shape = self._shape
+        self._shape = expanded_shape
+        
         # Decode the splats from the latents and pose
         splats, weights, sigmas = self.decode_splats(z, pose)
 
@@ -577,13 +585,25 @@ class GaussianSplatDecoder(BaseDecoder):
             splats, weights, sigmas, splat_sigma_range=self._splat_sigma_range
         )
 
+        # Reset renderer shape
+        self._shape = original_shape
+
         # Apply final convolution if needed
         if self._output_channels is not None and use_final_convolution:
             x = self._decoder(x)
             
-            # Crop to original shape after convolution
-            slices = tuple(slice(self._padding, -self._padding) for _ in range(self._ndim))
+            # Calculate crop to match input shape exactly
+            total_excess = tuple(x.shape[i+2] - self._shape[i] for i in range(self._ndim))
+            crop_start = tuple(e // 2 for e in total_excess)
+            crop_end = tuple(s + e//2 for s, e in zip(self._shape, total_excess))
+            
+            # Crop to original shape precisely
+            slices = tuple(slice(s, e) for s, e in zip(crop_start, crop_end))
             x = x[(slice(None), slice(None)) + slices]  # Keep batch and channel dims
+            
+            # Verify output shape
+            expected_shape = (x.shape[0], self._output_channels) + self._shape
+            assert x.shape == expected_shape, f"Output shape {x.shape} != expected {expected_shape}"
 
         return x
 
